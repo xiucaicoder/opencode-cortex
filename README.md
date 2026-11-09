@@ -42,8 +42,8 @@
 - `content` 最多 200 字。
 - `update` / `delete` 必须带 `id` 和 `version`；版本冲突会被拒绝并要求重新检索。
 - `add` 前做相似检索：
-  - 相似度 ≥ `dedupRejectThreshold`（默认 0.92）：拒绝，返回已有条目 id，提示改用 `update`。
-  - 相似度在 `dedupHintThreshold`（默认 0.85）与拒绝阈值之间：允许写入，同时返回相似提示。
+  - 相似度 ≥ `dedupRejectThreshold`（默认 0.92）：拒绝，返回已有条目 id，提示用 `update` 合并进该条目。
+  - 写入成功时总是返回最近 `dedupRelatedLimit`（默认 3）条相似度 ≥ `dedupRelatedThreshold`（默认 0.75）的 active 条目，含 `id`、`title`、`content`、`similarity`，由宿主 AI 判断是否应合并。
 - 标题、正文、`related_files`、`source_ref` 命中内置或自定义敏感信息规则时拒绝写入。
 - 带 `source_ref` 记为 `import`，否则记为 `manual`；自动提取记为 `auto`。
 - `delete` 只归档。
@@ -52,6 +52,10 @@
 
 ```json
 { "success": false, "code": "duplicate", "error": "…", "id": "…", "similarity": 0.93 }
+```
+
+```json
+{ "success": true, "id": "…", "version": 1, "related": [{ "id": "…", "title": "…", "content": "…", "similarity": 0.88 }] }
 ```
 
 ## 配置
@@ -70,7 +74,8 @@
 | `embeddingDtype` | `q8` | ONNX 权重精度 |
 | `embeddingDimensions` | `768` | 必须与模型一致 |
 | `dedupRejectThreshold` | `0.92` | 达到即拒绝新增 |
-| `dedupHintThreshold` | `0.85` | 达到即提示相似 |
+| `dedupRelatedThreshold` | `0.75` | 写入成功后返回相似条目的下限 |
+| `dedupRelatedLimit` | `3` | 写入成功后最多返回的相似条目数 |
 | `blockedPatterns` | `[]` | 额外敏感信息正则 |
 | `databaseEncryptionEnabled` | `false` | 可选 Turso 加密 |
 | `databaseEncryptionKey` | 自动生成 | 64 位十六进制 AES-256 密钥，仅限全局配置 |
@@ -93,7 +98,7 @@ bun run scripts/export.ts memories.md
 bun run scripts/export.ts memories.md --all   # 包含已归档条目
 ```
 
-导入沿用同一套长度、分类、密钥拦截和去重校验；相同内容重复导入会跳过。
+导入沿用同一套长度、分类、密钥拦截和去重校验；相同内容重复导入会跳过。被去重拒绝的条目会连同已有 `existing_id`、相似度写入当前目录的 `rejected.jsonl`，便于人工合并。
 
 ## 安装
 

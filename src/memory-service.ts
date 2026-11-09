@@ -35,11 +35,18 @@ export interface MutateInput {
   source_ref?: string;
 }
 
+export interface RelatedMemory {
+  id: string;
+  title: string;
+  content: string;
+  similarity: number;
+}
+
 export interface MutateResult {
   success: true;
   id: string;
   version: number;
-  warning?: { nearest_id: string; similarity: number };
+  related?: RelatedMemory[];
 }
 
 export interface ImportRecordInput {
@@ -326,22 +333,23 @@ export class MemoryService {
       actor === "auto" ? "auto" : actor === "import" ? "import" : sourceRef ? "import" : "manual";
     const vector = await this.embed(`${title}\n${content}`);
 
-    const nearest = (await this.store.findNearest(vector, 1))[0];
-    if (nearest) {
-      const similarity = roundSimilarity(nearest.similarity);
-      log("memory dedup nearest", { action: "add", similarity, nearest_id: nearest.id });
-      if (nearest.similarity >= this.config.dedupRejectThreshold) {
-        if (actor === "auto" && nearest.source !== "auto") {
+    const nearest = await this.store.findNearest(vector, this.config.dedupRelatedLimit);
+    const closest = nearest[0];
+    if (closest) {
+      const similarity = roundSimilarity(closest.similarity);
+      log("memory dedup nearest", { similarity });
+      if (closest.similarity >= this.config.dedupRejectThreshold) {
+        if (actor === "auto" && closest.source !== "auto") {
           throw new MemoryError(
             "duplicate_protected",
-            `与已有 ${nearest.source} 记忆相似度 ${similarity}，自动提取结果已丢弃`,
-            { id: nearest.id, similarity }
+            `与已有 ${closest.source} 记忆相似度 ${similarity}，自动提取结果已丢弃`,
+            { id: closest.id, similarity }
           );
         }
         throw new MemoryError(
           "duplicate",
-          `已存在相似记忆 ${nearest.id}（相似度 ${similarity}）。请改用 update 更新该条，而不是新增`,
-          { id: nearest.id, similarity }
+          `已存在相似记忆 ${closest.id}（相似度 ${similarity}）。请使用 update 把新事实合并进该条目，而不是新增`,
+          { id: closest.id, similarity }
         );
       }
     }
@@ -362,12 +370,16 @@ export class MemoryService {
     };
     await this.store.insert(record, vector);
 
-    const warning =
-      nearest && nearest.similarity >= this.config.dedupHintThreshold
-        ? { nearest_id: nearest.id, similarity: roundSimilarity(nearest.similarity) }
-        : undefined;
-    log("memory added", { id: record.id, category, source, has_warning: Boolean(warning) });
-    return { success: true, id: record.id, version: 1, ...(warning ? { warning } : {}) };
+    const related = nearest
+      .filter((item) => item.similarity >= this.config.dedupRelatedThreshold)
+      .map((item) => ({
+        id: item.id,
+        title: item.title,
+        content: item.content,
+        similarity: roundSimilarity(item.similarity),
+      }));
+    log("memory added", { id: record.id, category, source, related_count: related.length });
+    return { success: true, id: record.id, version: 1, related };
   }
 
   private async update(input: MutateInput, actor: Actor): Promise<MutateResult> {

@@ -10,9 +10,11 @@
   "embeddingDtype": "q8",
   "embeddingDimensions": 768,
 
-  // 相似度 >= 0.92 拒绝新增并返回已有 id；0.85~0.92 允许写入但提示相似
+  // 相似度 >= 0.92 拒绝新增并返回已有 id，提示用 update 合并
   "dedupRejectThreshold": 0.92,
-  "dedupHintThreshold": 0.85,
+  // 写入成功后返回最近 3 条相似度 >= 0.75 的条目，供宿主 AI 判断是否合并
+  "dedupRelatedThreshold": 0.75,
+  "dedupRelatedLimit": 3,
 
   // 额外敏感信息正则，命中 title/content/related_files/source_ref 即拒绝写入
   "blockedPatterns": [],

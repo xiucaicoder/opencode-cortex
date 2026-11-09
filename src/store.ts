@@ -38,6 +38,7 @@ export interface MemorySearchHit extends MemoryRecord {
 export interface NearestMemory {
   id: string;
   title: string;
+  content: string;
   source: MemorySource;
   similarity: number;
 }
@@ -46,6 +47,8 @@ export interface StoreOptions {
   dbPath: string;
   dimensions: number;
   model: string;
+  dtype: string;
+  pooling: string;
   encryption?: EncryptionOpts | null;
 }
 
@@ -83,12 +86,33 @@ function escapeLike(token: string): string {
 }
 
 function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .split(/[\s,，。；;:：、/\\|()（）[\]{}<>《》"'`]+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 2)
-    .slice(0, 16);
+  const normalized = text.toLowerCase().trim();
+  if (!normalized) return [];
+  try {
+    const segmenter = new Intl.Segmenter("zh", { granularity: "word" });
+    const words = [...segmenter.segment(normalized)]
+      .filter((part) => part.isWordLike)
+      .map((part) => part.segment.trim())
+      .filter((word) => word.length >= 2);
+    return [...new Set(words)].slice(0, 16);
+  } catch {
+    // Older runtimes without Intl.Segmenter: Latin words + CJK bigrams.
+    const tokens: string[] = [];
+    for (const chunk of normalized.split(/[\s,，。；;:：、/\\|()（）\[\]{}<>《》"'`]+/)) {
+      if (!chunk) continue;
+      if (/[\u3400-\u9fff]/.test(chunk)) {
+        if (chunk.length === 1) tokens.push(chunk);
+        else for (let i = 0; i < chunk.length - 1; i++) tokens.push(chunk.slice(i, i + 2));
+      } else if (chunk.length >= 2) {
+        tokens.push(chunk);
+      }
+    }
+    return [...new Set(tokens)].slice(0, 16);
+  }
+}
+
+export function tokenizeQuery(text: string): string[] {
+  return tokenize(text);
 }
 
 /**
@@ -184,6 +208,14 @@ export class MemoryStore {
             sql: "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
             args: ["embedding_dimensions", String(this.options.dimensions)],
           },
+          {
+            sql: "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
+            args: ["embedding_dtype", this.options.dtype],
+          },
+          {
+            sql: "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
+            args: ["embedding_pooling", this.options.pooling],
+          },
         ],
         "immediate"
       );
@@ -208,6 +240,8 @@ export class MemoryStore {
 
     const model = await this.getMetaWith(db, "embedding_model");
     const dimensions = await this.getMetaWith(db, "embedding_dimensions");
+    const dtype = await this.getMetaWith(db, "embedding_dtype");
+    const pooling = await this.getMetaWith(db, "embedding_pooling");
     if (model !== this.options.model) {
       throw new Error(
         `Embedding 模型不匹配：库由 ${model ?? "未知模型"} 建立，当前配置为 ${this.options.model}。请改回原模型或重建库。`
@@ -216,6 +250,16 @@ export class MemoryStore {
     if (dimensions !== String(this.options.dimensions)) {
       throw new Error(
         `Embedding 维度不匹配：库为 ${dimensions ?? "未知"} 维，当前配置为 ${this.options.dimensions} 维。请改回原维度或重建库。`
+      );
+    }
+    if (dtype !== this.options.dtype) {
+      throw new Error(
+        `Embedding dtype 不匹配：库为 ${dtype ?? "未知"}，当前配置为 ${this.options.dtype}。请改回原 dtype 或重建库。`
+      );
+    }
+    if (pooling !== this.options.pooling) {
+      throw new Error(
+        `Embedding pooling 不匹配：库为 ${pooling ?? "未知"}，当前为 ${this.options.pooling}。请恢复原 pooling 或重建库。`
       );
     }
   }
@@ -321,7 +365,7 @@ export class MemoryStore {
     const db = await this.connection();
     const json = JSON.stringify(Array.from(vector));
     const rows = (await db.all(
-      `SELECT id, title, source,
+      `SELECT id, title, content, source,
               1 - vector_distance_cos(vector, vector32(?)) AS similarity
        FROM memories
        WHERE status = 'active'
@@ -334,6 +378,7 @@ export class MemoryStore {
     return rows.map((row) => ({
       id: String(row.id),
       title: String(row.title),
+      content: String(row.content),
       source: String(row.source) as MemorySource,
       similarity: Math.max(0, Math.min(1, Number(row.similarity))),
     }));

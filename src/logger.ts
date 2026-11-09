@@ -1,4 +1,11 @@
-import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -10,11 +17,13 @@ export function setLogFile(path: string): void {
   logFile = path;
 }
 
+/** Rotate at 5 MB, keeping the current file plus two archived copies. */
 function rotateIfNeeded(): void {
   try {
-    if (existsSync(logFile) && statSync(logFile).size >= MAX_LOG_BYTES) {
-      renameSync(logFile, `${logFile}.1`);
-    }
+    if (!existsSync(logFile) || statSync(logFile).size < MAX_LOG_BYTES) return;
+    rmSync(`${logFile}.2`, { force: true });
+    if (existsSync(`${logFile}.1`)) renameSync(`${logFile}.1`, `${logFile}.2`);
+    renameSync(logFile, `${logFile}.1`);
   } catch {
     // Logging must never break memory operations.
   }

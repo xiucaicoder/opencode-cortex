@@ -8,7 +8,7 @@
  * or the project overview (at most 500 characters):
  *   {"type":"overview","content":"..."}
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createRuntime } from "../src/runtime.js";
 import { MemoryError } from "../src/memory-service.js";
@@ -39,9 +39,13 @@ async function main(): Promise<void> {
     .map((line) => line.trim())
     .filter(Boolean);
 
+  const rejectedPath = resolve("rejected.jsonl");
+  rmSync(rejectedPath, { force: true });
+
   let inserted = 0;
   let updated = 0;
   let skipped = 0;
+  const rejected: Array<Record<string, unknown>> = [];
   try {
     for (let index = 0; index < lines.length; index++) {
       const line = lines[index]!;
@@ -76,6 +80,12 @@ async function main(): Promise<void> {
       } catch (error) {
         if (error instanceof MemoryError && (error.code === "duplicate" || error.code === "duplicate_protected")) {
           skipped++;
+          rejected.push({
+            ...record,
+            existing_id: error.details.id ?? null,
+            similarity: error.details.similarity ?? null,
+            reason: error.code,
+          });
           console.log(`第 ${index + 1} 行: 跳过重复记忆 ${String(error.details.id ?? "")}`);
           continue;
         }
@@ -86,6 +96,10 @@ async function main(): Promise<void> {
     await runtime.service.close();
   }
 
+  if (rejected.length > 0) {
+    writeFileSync(rejectedPath, `${rejected.map((item) => JSON.stringify(item)).join("\n")}\n`, "utf-8");
+    console.log(`被去重拒绝的条目已写入 ${rejectedPath}`);
+  }
   console.log(`导入完成: 新增 ${inserted}，更新 ${updated}，跳过 ${skipped}`);
 }
 

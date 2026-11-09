@@ -2,6 +2,8 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { CortexConfig } from "./config.js";
 
+export const EMBEDDING_POOLING = "cls" as const;
+
 export interface Embedder {
   readonly model: string;
   readonly dimensions: number;
@@ -72,7 +74,7 @@ export class LocalEmbedder implements Embedder {
 
   async embed(text: string): Promise<Float32Array> {
     const extractor = await this.load();
-    const output = await extractor(text, { pooling: "cls", normalize: true });
+    const output = await extractor(text, { pooling: EMBEDDING_POOLING, normalize: true });
     const vector = new Float32Array(output.data);
     if (vector.length !== this.dimensions) {
       throw new Error(

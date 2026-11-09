@@ -61,7 +61,8 @@ export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRu
     databaseEncryptionEnabled: false,
     databaseEncryptionCipher: "aes256gcm",
     dedupRejectThreshold: 0.92,
-    dedupHintThreshold: 0.85,
+    dedupRelatedThreshold: 0.75,
+    dedupRelatedLimit: 3,
     blockedPatterns: [],
     ...overrides,
   };
@@ -71,6 +72,8 @@ export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRu
     dbPath: project.dbPath,
     dimensions: config.embeddingDimensions,
     model: config.embeddingModel,
+    dtype: config.embeddingDtype,
+    pooling: "cls",
     encryption: null,
   });
   const embedder = new FakeEmbedder();
@@ -89,7 +92,8 @@ export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRu
 
 export async function createSecondService(
   config: CortexConfig,
-  dbPath: string
+  dbPath: string,
+  pooling = "cls"
 ): Promise<{ service: MemoryService; embedder: FakeEmbedder }> {
   const embedder = new FakeEmbedder();
   const project = {
@@ -102,6 +106,8 @@ export async function createSecondService(
     dbPath,
     dimensions: config.embeddingDimensions,
     model: config.embeddingModel,
+    dtype: config.embeddingDtype,
+    pooling,
     encryption: null,
   });
   return { service: new MemoryService(config, project, store, embedder), embedder };

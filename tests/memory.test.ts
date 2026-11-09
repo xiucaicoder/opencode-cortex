@@ -184,7 +184,7 @@ describe("dedup thresholds", () => {
     }
   });
 
-  it("allows 0.85-0.92 but returns a similarity warning", async () => {
+  it("allows below 0.92 and returns up to three related entries", async () => {
     const runtime = createTestRuntime();
     try {
       runtime.embedder.set("退款规则\n退款需要财务审核", 0);
@@ -203,8 +203,10 @@ describe("dedup thresholds", () => {
         content: "退款由财务复核",
       });
       expect(second.success).toBe(true);
-      expect(second.warning?.nearest_id).toBe(first.id);
-      expect(second.warning?.similarity).toBeCloseTo(0.88, 3);
+      expect(second.related).toHaveLength(1);
+      expect(second.related?.[0]?.id).toBe(first.id);
+      expect(second.related?.[0]?.content).toBe("退款需要财务审核");
+      expect(second.related?.[0]?.similarity).toBeCloseTo(0.88, 3);
     } finally {
       await runtime.cleanup();
     }
@@ -333,6 +335,47 @@ describe("embedding and storage guards", () => {
       expect(error.message).toContain("512");
       expect(error.message).toContain("768");
     } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("rejects opening a store built with another dtype", async () => {
+    const runtime = createTestRuntime();
+    let second: Awaited<ReturnType<typeof createSecondService>> | undefined;
+    try {
+      await runtime.service.mutate({
+        action: "add",
+        title: "dtype 标记",
+        category: "domain_rule",
+        content: "结论",
+      });
+      second = await createSecondService(
+        { ...runtime.config, embeddingDtype: "fp32" },
+        runtime.dbPath
+      );
+      const error = await catchError(second.service.search("dtype 标记"));
+      expect(error.message).toContain("Embedding dtype 不匹配");
+    } finally {
+      await second?.service.close();
+      await runtime.cleanup();
+    }
+  });
+
+  it("rejects opening a store built with another pooling", async () => {
+    const runtime = createTestRuntime();
+    let second: Awaited<ReturnType<typeof createSecondService>> | undefined;
+    try {
+      await runtime.service.mutate({
+        action: "add",
+        title: "pooling 标记",
+        category: "domain_rule",
+        content: "结论",
+      });
+      second = await createSecondService(runtime.config, runtime.dbPath, "mean");
+      const error = await catchError(second.service.search("pooling 标记"));
+      expect(error.message).toContain("Embedding pooling 不匹配");
+    } finally {
+      await second?.service.close();
       await runtime.cleanup();
     }
   });

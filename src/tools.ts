@@ -94,7 +94,7 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService):
     editor.add({
       name: "memory_mutate",
       description:
-        "写入项目记忆。content 最多 200 字；category 必须是四类之一；update/delete 必须带 id 和 version。add 前会自动做相似去重，命中重复时请改用 update。",
+        "写入项目记忆。content 最多 200 字；category 必须是四类之一；update/delete 必须带 id 和 version。add 前会做相似去重；命中重复时请用 update 合并。add 成功后会在 related 中返回最相近的已有条目，请据此判断是否应改为 update。",
       input: MUTATE_INPUT as unknown as never,
       execute: async (args: MutateInput) => {
         try {

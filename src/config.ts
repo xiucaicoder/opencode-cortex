@@ -29,8 +29,10 @@ export interface CortexConfig {
   databaseEncryptionCipher: EncryptionCipher;
   /** Cosine similarity at or above this value rejects an add as a duplicate. */
   dedupRejectThreshold: number;
-  /** Cosine similarity at or above this value adds the entry with a hint. */
-  dedupHintThreshold: number;
+  /** On a successful add, return up to dedupRelatedLimit entries at or above this similarity. */
+  dedupRelatedThreshold: number;
+  /** Maximum number of related entries returned after a successful add. */
+  dedupRelatedLimit: number;
   /** Extra regular expressions rejected in title/content/related_files/source_ref. */
   blockedPatterns: string[];
   /** Provider id used by stage 2 extraction, e.g. "anthropic". */
@@ -47,7 +49,8 @@ const DEFAULTS: CortexConfig = {
   databaseEncryptionEnabled: false,
   databaseEncryptionCipher: "aes256gcm",
   dedupRejectThreshold: 0.92,
-  dedupHintThreshold: 0.85,
+  dedupRelatedThreshold: 0.75,
+  dedupRelatedLimit: 3,
   blockedPatterns: [],
 };
 
@@ -146,7 +149,12 @@ export function loadConfig(directory: string): CortexConfig {
       DEFAULTS.databaseEncryptionCipher
     ) as CortexConfig["databaseEncryptionCipher"],
     dedupRejectThreshold: thresholdField(raw, "dedupRejectThreshold", DEFAULTS.dedupRejectThreshold),
-    dedupHintThreshold: thresholdField(raw, "dedupHintThreshold", DEFAULTS.dedupHintThreshold),
+    dedupRelatedThreshold: thresholdField(
+      raw,
+      "dedupRelatedThreshold",
+      DEFAULTS.dedupRelatedThreshold
+    ),
+    dedupRelatedLimit: numberField(raw, "dedupRelatedLimit", DEFAULTS.dedupRelatedLimit),
     blockedPatterns: Array.isArray(raw.blockedPatterns)
       ? raw.blockedPatterns.map((value, index) => {
           if (typeof value !== "string" || !value) {
@@ -177,8 +185,8 @@ export function loadConfig(directory: string): CortexConfig {
   if (!Number.isInteger(config.embeddingDimensions) || config.embeddingDimensions <= 0) {
     throw new Error("配置项 embeddingDimensions 必须是正整数");
   }
-  if (config.dedupHintThreshold >= config.dedupRejectThreshold) {
-    throw new Error("dedupHintThreshold 必须小于 dedupRejectThreshold");
+  if (!Number.isInteger(config.dedupRelatedLimit) || config.dedupRelatedLimit < 1) {
+    throw new Error("dedupRelatedLimit 必须是正整数");
   }
   return config;
 }

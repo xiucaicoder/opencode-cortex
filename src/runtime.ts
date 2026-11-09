@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { loadConfig, type CortexConfig } from "./config.js";
 import { resolveProject, type ProjectInfo } from "./project.js";
 import { resolveEncryption } from "./encryption.js";
-import { LocalEmbedder } from "./embedding.js";
+import { EMBEDDING_POOLING, LocalEmbedder } from "./embedding.js";
 import { MemoryStore } from "./store.js";
 import { MemoryService } from "./memory-service.js";
 import { setLogFile } from "./logger.js";
@@ -25,6 +25,8 @@ export function createRuntime(
     dbPath: project.dbPath,
     dimensions: config.embeddingDimensions,
     model: config.embeddingModel,
+    dtype: config.embeddingDtype,
+    pooling: EMBEDDING_POOLING,
     encryption: resolveEncryption(config),
   });
   const service = new MemoryService(config, project, store, new LocalEmbedder(config));
