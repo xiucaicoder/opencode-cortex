@@ -28,9 +28,7 @@
     }
   },
   "scripts": {
-    "build": "rm -rf dist && bunx tsc && bun run web:build",
-    "web:dev": "cd web && bun run dev",
-    "web:build": "cd web && bun run build",
+    "build": "rm -rf dist && bunx tsc",
     "dev": "tsc --watch",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
@@ -75,7 +73,7 @@
     "onnxruntime-node": "1.31.1",
     "zod": "^4.6.7"
   },
-  "//": "Pin latest stable onnxruntime-node@1.31.1 (direct + override) with @huggingface/transformers: nested OpenCode installs ignore package overrides (#184); Ort::Env teardown fix shipped in 1.24.1 (#225). Intel Mac (darwin/x64) is unsupported — @tursodatabase/database and fixed onnxruntime releases ship no x64 binding.",
+  "//": "Pin latest stable onnxruntime-node@1.31.1 (direct + override) with @huggingface/transformers: nested OpenCode installs ignore package overrides (#184); Ort::Env teardown fix shipped in 1.24.1 (#225). Intel Mac (darwin/x64) is unsupported \u2014 @tursodatabase/database and fixed onnxruntime releases ship no x64 binding.",
   "overrides": {
     "onnxruntime-node": "1.31.1",
     "bun-types": "1.3.14"
@@ -89,8 +87,6 @@
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",
     "prettier": "^3.9.10",
-    "prettier-plugin-astro": "^1.1.2",
-    "prettier-plugin-svelte": "^4.1.1",
     "typescript": "6.0.3",
     "typescript-eslint": "^8.71.2"
   },
@@ -109,12 +105,6 @@
   "lint-staged": {
     "*.{js,mjs,cjs,ts}": [
       "eslint --fix",
-      "prettier --write"
-    ],
-    "*.svelte": [
-      "prettier --write"
-    ],
-    "*.astro": [
       "prettier --write"
     ],
     "*.{css,html,json,jsonc,md,yml,yaml}": [

@@ -12,11 +12,10 @@ import { awaitCaptureDrain, performAutoCapture } from "./services/auto-capture.j
 import { CaptureEvidenceRecorder } from "./services/capture-evidence.js";
 import { performUserProfileLearning } from "./services/user-memory-learning.js";
 import { userPromptManager } from "./services/user-prompt/user-prompt-manager.js";
-import { startWebServer, WebServer } from "./services/web-server.js";
+
 import { ensureTursoReady } from "./services/turso/ready.js";
 import { tursoConnectionManager } from "./services/turso/connection-manager.js";
 import { retainPluginTurso } from "./services/turso/plugin-refs.js";
-import { WebAuth } from "./services/web-auth.js";
 
 import { isConfigured, CONFIG, initConfig } from "./config.js";
 import { log } from "./services/logger.js";
@@ -368,7 +367,6 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
   const { startAutoUpdate } = await import("./services/auto-update.js");
   startAutoUpdate(ctx, CONFIG.autoUpdate);
   const tags = getTags(directory);
-  let webServer: WebServer | null = null;
   // One idle debounce timer per session: a new idle for the same session resets
   // its own timer, but must never cancel another session's pending capture
   // (starving a finished session's summary forever once no further idle
@@ -476,140 +474,14 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
     clearConnectedProvidersRefresher(providerRefresher);
   };
 
-  let tursoReadyForWeb = !isConfigured();
-  if (CONFIG.webServerEnabled && isConfigured()) {
-    try {
-      await ensureTursoReady();
-      tursoReadyForWeb = true;
-    } catch (error) {
-      log("Turso ready gate failed before web server start", { error: String(error) });
-      if (ctx.client?.tui) {
-        const { isTursoMultiProcessLockError } =
-          await import("./services/turso/connection-manager.js");
-        const lockHeld = isTursoMultiProcessLockError(error);
-        ctx.client.tui
-          .showToast({
-            body: {
-              title: "Memory Explorer",
-              message: lockHeld
-                ? process.platform === "win32"
-                  ? "Memory DB locked by another OpenCode session (Windows is single-owner)"
-                  : "Memory DB locked by another session — close it or restart all OpenCode windows"
-                : "Database migration failed; web UI not started",
-              variant: "error",
-              duration: 8000,
-            },
-          })
-          .catch(() => {});
-      }
-    }
-  }
-
   if (isConfigured() && CONFIG.memoryBackend === "markdown") {
     try {
-      if (!tursoReadyForWeb) {
-        await ensureTursoReady();
-        tursoReadyForWeb = true;
-      }
+      await ensureTursoReady();
       const { startMarkdownBackend } = await import("./services/markdown/backend.js");
       await startMarkdownBackend();
     } catch (mdError) {
       log("Markdown backend failed to start", { error: String(mdError) });
     }
-  }
-
-  if (CONFIG.webServerEnabled && tursoReadyForWeb) {
-    const webAuth = new WebAuth({
-      password: CONFIG.webServerAuthPassword,
-      username: CONFIG.webServerAuthUsername,
-    });
-    startWebServer({
-      port: CONFIG.webServerPort,
-      host: CONFIG.webServerHost,
-      enabled: CONFIG.webServerEnabled,
-      auth: webAuth,
-      apiToken: CONFIG.webServerApiToken,
-    })
-      .then((server) => {
-        webServer = server;
-        const url = webServer.getUrl();
-
-        webServer.setOnTakeoverCallback(async () => {
-          if (ctx.client?.tui) {
-            ctx.client.tui
-              .showToast({
-                body: {
-                  title: "Memory Explorer",
-                  message: "Took over web server ownership",
-                  variant: "success",
-                  duration: 3000,
-                },
-              })
-              .catch(() => {});
-          }
-        });
-
-        webServer.setOnPortsExhaustedCallback(() => {
-          if (ctx.client?.tui) {
-            ctx.client.tui
-              .showToast({
-                body: {
-                  title: "Memory Explorer",
-                  message: `Web UI unavailable: ports ${CONFIG.webServerPort}-${CONFIG.webServerPort + 10} are held by non-responsive processes`,
-                  variant: "error",
-                  duration: 5000,
-                },
-              })
-              .catch(() => {});
-          }
-        });
-
-        if (webServer.isServerOwner()) {
-          if (ctx.client?.tui) {
-            ctx.client.tui
-              .showToast({
-                body: {
-                  title: "Memory Explorer",
-                  message: webAuth.isEnabled()
-                    ? `Web UI started at ${url} (auth required)`
-                    : `Web UI started at ${url}`,
-                  variant: "success",
-                  duration: 5000,
-                },
-              })
-              .catch(() => {});
-          }
-        } else {
-          if (ctx.client?.tui) {
-            ctx.client.tui
-              .showToast({
-                body: {
-                  title: "Memory Explorer",
-                  message: `Web UI available at ${url}`,
-                  variant: "info",
-                  duration: 3000,
-                },
-              })
-              .catch(() => {});
-          }
-        }
-      })
-      .catch((error) => {
-        log("Web server failed to start", { error: String(error) });
-
-        if (ctx.client?.tui) {
-          ctx.client.tui
-            .showToast({
-              body: {
-                title: "Memory Explorer Error",
-                message: `Failed to start: ${String(error)}`,
-                variant: "error",
-                duration: 5000,
-              },
-            })
-            .catch(() => {});
-        }
-      });
   }
 
   const cleanupPlugin = async () => {
@@ -629,7 +501,6 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
     } catch {
       /* ignore */
     }
-    if (webServer) await webServer.stop();
     if (memoryClient) await memoryClient.close();
   };
 
@@ -1357,13 +1228,11 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
 
             // Retention cleanup stays owner-only: it is storage-wide maintenance
             // that has no reason to run once per active instance.
-            if (webServer?.isServerOwner()) {
-              const { cleanupService } = await import("./services/cleanup-service.js");
-              if (await cleanupService.shouldRunCleanup()) await cleanupService.runCleanup();
+            const { cleanupService } = await import("./services/cleanup-service.js");
+            if (await cleanupService.shouldRunCleanup()) await cleanupService.runCleanup();
 
-              const { dreamingService } = await import("./services/dreaming-service.js");
-              await dreamingService.maybeRun(directory);
-            }
+            const { dreamingService } = await import("./services/dreaming-service.js");
+            await dreamingService.maybeRun(directory);
           } catch (error) {
             log("Idle processing error", { error: String(error) });
           } finally {
