@@ -21,6 +21,17 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .env.test.local
 .env.production.local
 .env.local
+.env.*
+!.env.example
+
+# Local project configuration and generated memory data
+.opencode/opencode-cortex.jsonc
+*.db
+*.db-shm
+*.db-wal
+db.key
+dry-run.jsonl
+rejected.jsonl
 
 # caches
 .eslintcache
