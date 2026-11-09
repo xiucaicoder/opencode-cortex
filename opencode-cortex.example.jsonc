@@ -23,7 +23,33 @@
   "databaseEncryptionEnabled": false,
   // "databaseEncryptionKey": "64 位十六进制字符，只能放全局配置",
 
-  // 后续自动提取使用；opencodeModel 可为 "inherit"
-  // "opencodeProvider": "anthropic",
-  // "opencodeModel": "claude-haiku-4-5-20251001"
+  // 自动提取使用的固定模型；也可设为 "inherit" 跟随宿主默认模型
+  "opencodeProvider": "opencode-go",
+  "opencodeModel": "opencode-go/glm-5.3-flash",
+  // 推理档位，glm-5.3-flash 支持 low / high / max
+  "opencodeVariant": "low",
+
+  // 记忆注入：first 仅会话首个请求，always 每个请求都注入
+  // 注入内容为项目概览与 active 标题目录，不包含正文
+  "injectOn": "first",
+  "injectMaxTitles": 150,
+
+  // 会话空闲后自动提取记忆；每次 idle 最多一次模型调用
+  // 失败只记日志、不重试，不阻塞宿主会话
+  "autoExtract": {
+    "enabled": true,
+    // 至少新增多少条用户消息才尝试提取
+    "minNewMessages": 1,
+    // 增量文本少于该字符数则跳过
+    "minInputChars": 80,
+    // 同一会话两次提取的最小间隔（分钟），0 表示不限制
+    "cooldownMinutes": 10,
+    "maxInputChars": 12000,
+    "maxAssistantChars": 4000,
+    "maxMessages": 40,
+    // 单次最多接受的条目数
+    "maxItems": 10,
+    // 单次模型调用超时（毫秒）
+    "timeoutMs": 60000
+  }
 }

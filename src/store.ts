@@ -193,6 +193,11 @@ export class MemoryStore {
         );
         CREATE INDEX IF NOT EXISTS idx_memories_status_updated ON memories(status, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+        CREATE TABLE IF NOT EXISTS session_state (
+          session_id TEXT PRIMARY KEY,
+          last_extracted_message_id TEXT,
+          last_extracted_at INTEGER
+        );
       `);
       await db.batch(
         [
@@ -262,6 +267,13 @@ export class MemoryStore {
         `Embedding pooling 不匹配：库为 ${pooling ?? "未知"}，当前为 ${this.options.pooling}。请恢复原 pooling 或重建库。`
       );
     }
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS session_state (
+        session_id TEXT PRIMARY KEY,
+        last_extracted_message_id TEXT,
+        last_extracted_at INTEGER
+      )
+    `);
   }
 
   private async getMetaWith(db: Database, key: string): Promise<string | null> {
@@ -288,6 +300,35 @@ export class MemoryStore {
     await this.setMeta("project_identity", info.identity);
     await this.setMeta("project_path", info.root);
     await this.setMeta("project_name", info.name);
+  }
+
+  async getSessionState(sessionID: string): Promise<{
+    last_extracted_message_id: string | null;
+    last_extracted_at: number | null;
+  }> {
+    const db = await this.connection();
+    const row = (await db.get(
+      "SELECT last_extracted_message_id, last_extracted_at FROM session_state WHERE session_id = ?",
+      sessionID
+    )) as { last_extracted_message_id?: string; last_extracted_at?: number } | null;
+    return {
+      last_extracted_message_id: row?.last_extracted_message_id ?? null,
+      last_extracted_at: row?.last_extracted_at ?? null,
+    };
+  }
+
+  async setSessionState(sessionID: string, messageID: string, at: number): Promise<void> {
+    const db = await this.connection();
+    await db.run(
+      `INSERT INTO session_state (session_id, last_extracted_message_id, last_extracted_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         last_extracted_message_id = excluded.last_extracted_message_id,
+         last_extracted_at = excluded.last_extracted_at`,
+      sessionID,
+      messageID,
+      at
+    );
   }
 
   async getOverview(): Promise<string> {

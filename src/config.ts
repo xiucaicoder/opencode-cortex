@@ -35,10 +35,30 @@ export interface CortexConfig {
   dedupRelatedLimit: number;
   /** Extra regular expressions rejected in title/content/related_files/source_ref. */
   blockedPatterns: string[];
-  /** Provider id used by stage 2 extraction, e.g. "anthropic". */
-  opencodeProvider?: string;
-  /** Model id used by stage 2 extraction. "inherit" follows the host default. */
-  opencodeModel?: string;
+  /** Provider id used by automatic extraction. */
+  opencodeProvider: string;
+  /** Model ref used by automatic extraction; "inherit" follows the host default. */
+  opencodeModel: string;
+  /** Reasoning variant for the extraction model (low/high/max where supported). */
+  opencodeVariant?: string;
+  /** Inject memory context on the first prompt of a session, or on every prompt. */
+  injectOn: "first" | "always";
+  /** Maximum number of titles in the injected directory. */
+  injectMaxTitles: number;
+  autoExtract: {
+    enabled: boolean;
+    /** Minimum number of new user messages before calling the extraction model. */
+    minNewMessages: number;
+    /** Minimum combined characters of new user messages + final reply. */
+    minInputChars: number;
+    /** Per-session cooldown after a successful or failed extraction attempt. */
+    cooldownMinutes: number;
+    maxInputChars: number;
+    maxAssistantChars: number;
+    maxMessages: number;
+    maxItems: number;
+    timeoutMs: number;
+  };
 }
 
 const DEFAULTS: CortexConfig = {
@@ -52,6 +72,22 @@ const DEFAULTS: CortexConfig = {
   dedupRelatedThreshold: 0.75,
   dedupRelatedLimit: 3,
   blockedPatterns: [],
+  opencodeProvider: "opencode-go",
+  opencodeModel: "opencode-go/glm-5.3-flash",
+  opencodeVariant: "low",
+  injectOn: "first",
+  injectMaxTitles: 150,
+  autoExtract: {
+    enabled: true,
+    minNewMessages: 1,
+    minInputChars: 80,
+    cooldownMinutes: 10,
+    maxInputChars: 12000,
+    maxAssistantChars: 4000,
+    maxMessages: 40,
+    maxItems: 10,
+    timeoutMs: 60000,
+  },
 };
 
 const DTYPES = new Set(["fp32", "fp16", "q8", "int8", "uint8", "q4", "q4f16", "bnb4"]);
@@ -116,6 +152,25 @@ function thresholdField(raw: Record<string, unknown>, key: string, fallback: num
   return value;
 }
 
+function objectField(
+  raw: Record<string, unknown>,
+  key: string
+): Record<string, unknown> | undefined {
+  const value = raw[key];
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`配置项 ${key} 必须是对象`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function positiveInteger(value: number, key: string, allowZero = false): number {
+  if (!Number.isInteger(value) || value < (allowZero ? 0 : 1)) {
+    throw new Error(`配置项 ${key} 必须是${allowZero ? "非负" : "正"}整数`);
+  }
+  return value;
+}
+
 /** Load global config, then apply the project config as overrides. */
 export function loadConfig(directory: string): CortexConfig {
   const globalRaw = existsSync(GLOBAL_CONFIG_PATH) ? readJsonc(GLOBAL_CONFIG_PATH) : {};
@@ -129,6 +184,7 @@ export function loadConfig(directory: string): CortexConfig {
   }
 
   const raw = { ...globalRaw, ...projectRaw };
+  const autoRaw = objectField(raw, "autoExtract") ?? {};
   const config: CortexConfig = {
     storagePath: expandHome(stringField(raw, "storagePath", DEFAULTS.storagePath)),
     embeddingModel: stringField(raw, "embeddingModel", DEFAULTS.embeddingModel),
@@ -163,12 +219,38 @@ export function loadConfig(directory: string): CortexConfig {
           return value;
         })
       : [],
-    ...(typeof raw.opencodeProvider === "string" && raw.opencodeProvider.trim()
-      ? { opencodeProvider: raw.opencodeProvider.trim() }
-      : {}),
-    ...(typeof raw.opencodeModel === "string" && raw.opencodeModel.trim()
-      ? { opencodeModel: raw.opencodeModel.trim() }
-      : {}),
+    opencodeProvider: stringField(raw, "opencodeProvider", DEFAULTS.opencodeProvider),
+    opencodeModel: stringField(raw, "opencodeModel", DEFAULTS.opencodeModel),
+    ...(typeof raw.opencodeVariant === "string" && raw.opencodeVariant.trim()
+      ? { opencodeVariant: raw.opencodeVariant.trim() }
+      : DEFAULTS.opencodeVariant
+        ? { opencodeVariant: DEFAULTS.opencodeVariant }
+        : {}),
+    injectOn: stringField(raw, "injectOn", DEFAULTS.injectOn) as CortexConfig["injectOn"],
+    injectMaxTitles: numberField(raw, "injectMaxTitles", DEFAULTS.injectMaxTitles),
+    autoExtract: {
+      enabled: booleanField(autoRaw, "enabled", DEFAULTS.autoExtract.enabled),
+      minNewMessages: numberField(
+        autoRaw,
+        "minNewMessages",
+        DEFAULTS.autoExtract.minNewMessages
+      ),
+      minInputChars: numberField(autoRaw, "minInputChars", DEFAULTS.autoExtract.minInputChars),
+      cooldownMinutes: numberField(
+        autoRaw,
+        "cooldownMinutes",
+        DEFAULTS.autoExtract.cooldownMinutes
+      ),
+      maxInputChars: numberField(autoRaw, "maxInputChars", DEFAULTS.autoExtract.maxInputChars),
+      maxAssistantChars: numberField(
+        autoRaw,
+        "maxAssistantChars",
+        DEFAULTS.autoExtract.maxAssistantChars
+      ),
+      maxMessages: numberField(autoRaw, "maxMessages", DEFAULTS.autoExtract.maxMessages),
+      maxItems: numberField(autoRaw, "maxItems", DEFAULTS.autoExtract.maxItems),
+      timeoutMs: numberField(autoRaw, "timeoutMs", DEFAULTS.autoExtract.timeoutMs),
+    },
     ...(typeof raw.databaseEncryptionKey === "string" && raw.databaseEncryptionKey.trim()
       ? { databaseEncryptionKey: raw.databaseEncryptionKey.trim() }
       : {}),
@@ -188,5 +270,18 @@ export function loadConfig(directory: string): CortexConfig {
   if (!Number.isInteger(config.dedupRelatedLimit) || config.dedupRelatedLimit < 1) {
     throw new Error("dedupRelatedLimit 必须是正整数");
   }
+  if (config.injectOn !== "first" && config.injectOn !== "always") {
+    throw new Error("injectOn 必须是 first 或 always");
+  }
+  positiveInteger(config.injectMaxTitles, "injectMaxTitles");
+  positiveInteger(config.autoExtract.minNewMessages, "autoExtract.minNewMessages");
+  positiveInteger(config.autoExtract.minInputChars, "autoExtract.minInputChars", true);
+  positiveInteger(config.autoExtract.cooldownMinutes, "autoExtract.cooldownMinutes", true);
+  positiveInteger(config.autoExtract.maxInputChars, "autoExtract.maxInputChars");
+  positiveInteger(config.autoExtract.maxAssistantChars, "autoExtract.maxAssistantChars");
+  positiveInteger(config.autoExtract.maxMessages, "autoExtract.maxMessages");
+  positiveInteger(config.autoExtract.maxItems, "autoExtract.maxItems");
+  positiveInteger(config.autoExtract.timeoutMs, "autoExtract.timeoutMs");
+  if (!config.opencodeModel.trim()) throw new Error("opencodeModel 不能为空");
   return config;
 }

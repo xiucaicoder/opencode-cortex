@@ -66,6 +66,21 @@ export interface ImportRecordResult {
   version: number;
 }
 
+export interface TitleEntry {
+  id: string;
+  category: MemoryCategory;
+  title: string;
+}
+
+export interface AutoMutation {
+  action: "add" | "update";
+  id?: string;
+  title: string;
+  category: string;
+  content: string;
+  related_files?: string[];
+}
+
 export class MemoryError extends Error {
   constructor(
     public readonly code: string,
@@ -235,6 +250,56 @@ export class MemoryService {
   async listArchived(): Promise<MemoryHit[]> {
     await this.ready();
     return (await this.store.listArchived()).map(toHit);
+  }
+
+  async listTitles(limit: number): Promise<TitleEntry[]> {
+    await this.ready();
+    return this.store.listActiveTitles(limit);
+  }
+
+  async getSessionState(sessionID: string): Promise<{
+    last_extracted_message_id: string | null;
+    last_extracted_at: number | null;
+  }> {
+    await this.ready();
+    return this.store.getSessionState(sessionID);
+  }
+
+  async setSessionState(sessionID: string, messageID: string, at: number): Promise<void> {
+    await this.ready();
+    await this.store.setSessionState(sessionID, messageID, at);
+  }
+
+  /** Auto extraction may add or update (never delete); version is resolved internally. */
+  async autoMutate(input: AutoMutation): Promise<MutateResult> {
+    await this.ready();
+    if (input.action === "update") {
+      const id = requiredString(input.id, "id");
+      const current = await this.store.getById(id);
+      if (!current) throw new MemoryError("not_found", `记忆 ${id} 不存在`, { id });
+      return this.mutate(
+        {
+          action: "update",
+          id,
+          version: current.version,
+          title: input.title,
+          category: input.category,
+          content: input.content,
+          related_files: input.related_files,
+        },
+        "auto"
+      );
+    }
+    return this.mutate(
+      {
+        action: "add",
+        title: input.title,
+        category: input.category,
+        content: input.content,
+        related_files: input.related_files,
+      },
+      "auto"
+    );
   }
 
   /**

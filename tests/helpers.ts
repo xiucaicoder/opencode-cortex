@@ -64,6 +64,22 @@ export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRu
     dedupRelatedThreshold: 0.75,
     dedupRelatedLimit: 3,
     blockedPatterns: [],
+    opencodeProvider: "opencode-go",
+    opencodeModel: "opencode-go/glm-5.3-flash",
+    opencodeVariant: "low",
+    injectOn: "first",
+    injectMaxTitles: 150,
+    autoExtract: {
+      enabled: true,
+      minNewMessages: 1,
+      minInputChars: 80,
+      cooldownMinutes: 10,
+      maxInputChars: 12000,
+      maxAssistantChars: 4000,
+      maxMessages: 40,
+      maxItems: 10,
+      timeoutMs: 60000,
+    },
     ...overrides,
   };
   setLogFile(join(dir, "test.log"));
