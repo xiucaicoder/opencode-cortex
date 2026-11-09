@@ -15,12 +15,10 @@
     "build": "rm -rf dist && bunx tsc",
     "dev": "tsc --watch",
     "test": "bun test",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint . --max-warnings=0",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
-    "check": "bun run format:check && bun run lint && bun run typecheck",
-    "prepare": "husky"
+    "typecheck": "tsc -p tsconfig.check.json --noEmit",
+    "import": "bun run scripts/import.ts",
+    "export": "bun run scripts/export.ts",
+    "smoke": "bun run scripts/smoke.ts"
   },
   "keywords": [
     "opencode",
@@ -37,7 +35,8 @@
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
     "@tursodatabase/database": "^0.8.3",
-    "onnxruntime-node": "1.31.1"
+    "onnxruntime-node": "1.31.1",
+    "@tursodatabase/database-common": "^0.8.3"
   },
   "//": "Pin latest stable onnxruntime-node@1.31.1 (direct + override) with @huggingface/transformers: nested OpenCode installs ignore package overrides (#184); Ort::Env teardown fix shipped in 1.24.1 (#225). Intel Mac (darwin/x64) is unsupported \u2014 @tursodatabase/database and fixed onnxruntime releases ship no x64 binding.",
   "overrides": {
@@ -45,16 +44,8 @@
     "bun-types": "1.3.14"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
     "@types/bun": "^1.4.3",
-    "eslint": "^10.12.0",
-    "eslint-config-prettier": "^10.1.8",
-    "globals": "^17.13.0",
-    "husky": "^9.1.7",
-    "lint-staged": "^17.6.0",
-    "prettier": "^3.9.10",
     "typescript": "6.0.3",
-    "typescript-eslint": "^8.71.2",
     "@opencode/plugin": "^2.2.5"
   },
   "opencode": {
@@ -62,17 +53,9 @@
   },
   "files": [
     "dist",
-    "package.json"
+    "package.json",
+    "scripts"
   ],
-  "lint-staged": {
-    "*.{js,mjs,cjs,ts}": [
-      "eslint --fix",
-      "prettier --write"
-    ],
-    "*.{css,html,json,jsonc,md,yml,yaml}": [
-      "prettier --write"
-    ]
-  },
   "peerDependencies": {
     "@opencode/plugin": "^2.0.0"
   }

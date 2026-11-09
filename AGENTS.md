@@ -1,96 +1,49 @@
 # AGENTS.md
 
-Guidance for coding agents working on **opencode-mem** — a persistent memory plugin for OpenCode (Turso/libSQL vector search, auto-capture, web UI).
+Guidance for coding agents working on **opencode-cortex**, a project-scoped business/architecture memory plugin for OpenCode v2.
 
 ## Stack & layout
 
 - Runtime / package manager: **Bun**
-- Language: TypeScript (`src/`), Svelte web UI (`web/`)
-- Tests: `tests/` via `bun test`
-- Plugin entrypoints: `src/plugin.ts`, `src/v2/`, exports in `package.json`
+- Language: TypeScript (`src/`), tests in `tests/` via `bun test`
+- Entry: `src/plugin.ts` → `dist/plugin.js`
+- Core files:
+  - `src/store.ts` — Turso schema v1, vector/keyword search, versioned writes
+  - `src/memory-service.ts` — validation, dedup, secrets, optimistic locking
+  - `src/tools.ts` — `memory_search` / `memory_mutate`
+  - `src/embedding.ts` — local `Xenova/bge-base-zh-v1.5`
+  - `src/project.ts` — project marker and per-project DB identity
+- Scripts: `scripts/import.ts`, `scripts/export.ts`, `scripts/smoke.ts`
 
 ## Commands
 
 ```bash
 bun install
-bun test
 bun run typecheck
-bun run check          # format + lint + typecheck
 bun run build
-bun run web:dev        # web UI only
+bun test
+bun run scripts/smoke.ts
 ```
 
-Prefer `bun` over `npm`/`npx`. Use `bunx` when a one-off binary is needed.
+## Invariants
 
-## Commits — Conventional Commits only
+- Exactly four categories: `domain_rule`, `arch_decision`, `data_constraint`, `pitfall`.
+- `content` ≤ 200 characters (code points, not bytes).
+- Only two model-facing tools; import/export stay as scripts.
+- `delete` archives (`status=archived`); never hard-delete rows.
+- `update`/`delete` require `version`; stale versions are rejected.
+- Writes and their vectors live in one row, so a single INSERT/UPDATE is atomic.
+- Dedup uses **raw cosine similarity**; search may use hybrid keyword ranking.
+- The database stores embedding model + dimensions. Mismatch must fail loudly; never re-embed or migrate silently.
+- No legacy schema, shard, DiskANN or opencode-mem migration code.
+- Never log memory content, secret matches or full request bodies. Logs may include ids, counts and similarity values only.
+- One database per project identity; do not add a global cross-project store.
+- No timers for background work; stage 2/3 run off session events.
 
-All commits **MUST** follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
+## Commits
 
-```
-<type>[optional scope]: <description>
+Conventional Commits only. One logical change per commit. Do not push.
 
-[optional body]
+## Security
 
-[optional footer(s)]
-```
-
-### Allowed types
-
-| Type       | Use for                                   |
-| ---------- | ----------------------------------------- |
-| `feat`     | New user-facing capability (MINOR)        |
-| `fix`      | Bug fix (PATCH)                           |
-| `docs`     | Docs / README / comments only             |
-| `style`    | Formatting; no logic change               |
-| `refactor` | Internal change; no feat/fix              |
-| `perf`     | Performance improvement                   |
-| `test`     | Tests only                                |
-| `build`    | Build system / bundling                   |
-| `ci`       | CI workflows / hooks                      |
-| `chore`    | Maintenance, deps, release plumbing       |
-| `revert`   | Reverts; reference SHAs in `Refs:` footer |
-
-### Rules
-
-- Description: imperative, concise, no trailing period (`fix: harden provider discovery`)
-- Scope (optional): area of the change, e.g. `feat(turso):`, `fix(ai):`, `chore(deps):`
-- Breaking changes: `!` after type/scope **or** a `BREAKING CHANGE:` footer
-- One logical change per commit when practical
-- Do **not** invent types outside the table above
-
-Examples from this repo:
-
-```
-feat(config): add opencodeVariant for internal LLM calls
-fix(v2): refresh connected providers after late host registration
-chore(deps): bump the minor-and-patch group across 2 directories
-```
-
-## Pull requests
-
-**Cleanest workflow (preferred):** squash-merge. Then only the **PR title** lands on `main` as the commit — so the title **MUST** be a valid Conventional Commit subject (same rules as commits).
-
-| Part     | Format                                                                             |
-| -------- | ---------------------------------------------------------------------------------- |
-| PR title | Conventional Commit subject (`fix(ai): …`, `feat(turso): …`)                       |
-| PR body  | Free-form — use `.github/PULL_REQUEST_TEMPLATE.md` (Summary, Test plan, Checklist) |
-
-- Do **not** put Conventional Commit syntax in the PR body
-- Base branch: `main`
-- Before opening: `bun test`, `bun run typecheck`, and `bun run check` when code changes
-- Update README / docs when behavior or contribution process changes
-- If the PR is not squashed and multiple commits merge: **every** commit on the branch must still be Conventional Commits
-
-## Code & review habits
-
-- Match existing patterns in the touched area; avoid drive-by refactors
-- Keep diffs focused on the requested change
-- Prefer existing libraries and utilities already in the tree
-- Do not commit secrets, local data under `data/`, or `node_modules`
-- Intel Mac (`darwin/x64`) is unsupported (Turso / onnxruntime bindings)
-
-## When unsure
-
-- Prefer a small, reviewable PR over a large mixed one
-- Ask before destructive git operations (`push --force`, hard reset, history rewrite)
-- Only commit when explicitly asked
+Do not commit secrets, local databases, model caches or logs. New write paths (auto extraction, import, dreaming) must reuse the same validation and secret checks as `memory_mutate`.

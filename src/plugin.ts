@@ -1,13 +1,16 @@
 import type { Plugin } from "@opencode/plugin/promise/plugin";
-import pkg from "../package.json" with { type: "json" };
+import { createRuntime } from "./runtime.js";
+import { registerMemoryTools } from "./tools.js";
 
-/**
- * Placeholder entry while the legacy subsystems are removed.
- * Stage 1 replaces this with the project-scoped memory tools.
- */
 const OpenCodeCortexPlugin: Plugin = {
-  id: typeof pkg.name === "string" && pkg.name.trim() ? pkg.name.trim() : "opencode-cortex",
-  async setup() {},
+  id: "opencode-cortex",
+  async setup(ctx) {
+    const runtime = createRuntime(ctx.location.directory);
+    await registerMemoryTools(ctx, runtime.service);
+    return async () => {
+      await runtime.service.close();
+    };
+  },
 };
 
 export default OpenCodeCortexPlugin;

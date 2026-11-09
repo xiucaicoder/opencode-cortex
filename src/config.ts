@@ -1,1650 +1,184 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { stripJsoncComments } from "./services/jsonc.js";
-import { resolveSecretValue } from "./services/secret-resolver.js";
-function isPlaceholderApiKey(value: string | undefined | null): boolean {
-  return /^(?:YOUR_|REPLACE_|EXAMPLE_|TOKEN_PLACEHOLDER$)/.test((value ?? "").trim());
-}
+import type { EncryptionCipher } from "@tursodatabase/database-common";
 
-function isMemoryProviderPreset(_value: unknown): boolean {
-  return false;
-}
+export const GLOBAL_CONFIG_PATH = join(
+  homedir(),
+  ".config",
+  "opencode",
+  "opencode-cortex.jsonc"
+);
+export const DEFAULT_STORAGE_PATH = join(homedir(), ".opencode-cortex");
+export const DEFAULT_EMBEDDING_MODEL = "Xenova/bge-base-zh-v1.5";
+export const DEFAULT_EMBEDDING_DIMENSIONS = 768;
+export const PROJECT_MARKER = ".opencode-cortex-project";
 
-function resolveMemoryProviderPresetDefaults(
-  _value: unknown
-): { model?: string; apiUrl?: string } | undefined {
-  return undefined;
-}
-import { getDefaultInjectionMarkers } from "./services/injected-prompt-filter.js";
-
-const CONFIG_DIR = join(homedir(), ".config", "opencode");
-const DATA_DIR = join(homedir(), ".opencode-mem");
-const CONFIG_FILES = [
-  join(CONFIG_DIR, "opencode-mem.jsonc"),
-  join(CONFIG_DIR, "opencode-mem.json"),
-];
-
-if (!existsSync(CONFIG_DIR)) {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-}
-
-if (!existsSync(DATA_DIR)) {
-  mkdirSync(DATA_DIR, { recursive: true });
-}
-
-interface OpenCodeMemConfig {
-  storagePath?: string;
-  /**
-   * Memory persistence backend. `database` (default) stores content in Turso.
-   * `markdown` uses a folder of `.md` files as source of truth; Turso is only
-   * a rebuildable semantic-search index.
-   */
-  memoryBackend?: "database" | "markdown";
-  /**
-   * Absolute or `~/…` path to the Markdown vault. Required when
-   * `memoryBackend` is `"markdown"`. All `.md` files under this path are indexed.
-   */
-  markdownPath?: string;
-  userEmailOverride?: string;
-  userNameOverride?: string;
-  memory?: {
-    defaultScope?: "project" | "all-projects";
-  };
-  embeddingModel?: string;
-  embeddingDimensions?: number;
-  embeddingApiUrl?: string;
-  embeddingApiKey?: string;
-  /** Opt-in Nomic task prefixes (`search_document:` / `search_query:`). Default false. */
-  embeddingUseTaskPrefixes?: boolean;
-  /**
-   * Local transformers.js pooling strategy. Default `"mean"`.
-   * Model presets (bge-m3 → cls, Qwen3-Embedding → last_token) apply when unset.
-   */
-  embeddingPooling?: "mean" | "cls" | "last_token";
-  /**
-   * Prefix applied to query-task embeddings. When unset, model presets or
-   * `embeddingUseTaskPrefixes` (Nomic) may supply one. Explicit `""` disables.
-   */
-  embeddingQueryPrefix?: string;
-  /**
-   * Prefix applied to document-task embeddings. Same resolution rules as
-   * `embeddingQueryPrefix`.
-   */
-  embeddingDocumentPrefix?: string;
-  /**
-   * Optional dtype for the local ONNX pipeline (e.g. `"q8"`, `"fp32"`).
-   * When set, passed to `pipeline({ dtype })` and outranks auto-detection.
-   */
-  embeddingDtype?: string;
-  /**
-   * Release the local ONNX pipeline after this many idle milliseconds.
-   * `0` (default) keeps it loaded for the process lifetime.
-   */
-  embeddingIdleTimeoutMs?: number;
-  similarityThreshold?: number;
-  maxMemories?: number;
-  /**
-   * @deprecated No effect. Use userProfileInjectPreferences, userProfileInjectPatterns,
-   * and userProfileInjectWorkflows to limit injected profile context.
-   */
-  maxProfileItems?: number;
-  injectProfile?: boolean;
-  containerTagPrefix?: string;
-  autoCaptureEnabled?: boolean;
-  autoCaptureMaxIterations?: number;
-  autoCaptureIterationTimeout?: number;
-  autoCaptureMaxRetries?: number;
-  autoCaptureMaxContextBytes?: number;
-  autoCaptureLanguage?: string;
-  /**
-   * When true, auto-capture searches for similar memories before insert and
-   * may update or supersede an existing entry instead of always adding.
-   * Default false (opt-in).
-   */
-  updateOnCaptureEnabled?: boolean;
-  /** Cosine/hybrid floor for update-on-capture candidates. Default 0.75. */
-  updateOnCaptureSimilarityThreshold?: number;
-  /** Max similar memories shown to the decision LLM. Default 5. */
-  updateOnCaptureMaxCandidates?: number;
-  /**
-   * Which auto-capture summary channel to try first when both opencode and
-   * manual (memoryModel/memoryApiUrl) providers are configured.
-   * Default "opencode-first". Use "external-first" for lower latency when the
-   * host session API is busy; failed primary channel falls back to the other.
-   */
-  autoCaptureProviderOrder?: "opencode-first" | "external-first";
-  memoryProvider?:
-    | "atlas-cloud"
-    | "api-route"
-    | "cheaper-inference"
-    | "openai-chat"
-    | "openai-responses"
-    | "anthropic"
-    | "minimax"
-    | "orcarouter"
-    | "runcrate"
-    | "cloudgpu"
-    | "standardcompute";
-  memoryModel?: string;
-  memoryApiUrl?: string;
-  memoryApiKey?: string;
-  memoryTemperature?: number | false;
-  /**
-   * Force chat-completion providers to send `tool_choice: "required"`.
-   * Defaults to true when unset. Set to false for models that reject forced
-   * tool choice (e.g. some thinking/reasoning modes).
-   */
-  forceToolChoice?: boolean;
-  memoryExtraParams?: Record<string, unknown>;
-  opencodeProvider?: string;
-  opencodeModel?: string;
-  /**
-   * Optional reasoning variant for internal LLM calls that use
-   * opencodeProvider/opencodeModel (e.g. "xhigh"). Applied whenever set,
-   * including with opencodeModel "inherit", so background work can pin a
-   * cheaper/faster/higher variant than the interactive session default.
-   */
-  opencodeVariant?: string;
-  /**
-   * Timeout in milliseconds for the plugin's internal structured-output LLM
-   * calls (auto-capture summaries, profile learning). Profile cleanup keeps
-   * its own longer timeout. Clamped to 10000..600000; non-number/non-finite
-   * values (and non-numeric strings) fall back to the 90000 default. Numeric
-   * strings like "180000" are coerced.
-   */
-  opencodeTimeoutMs?: number;
-  aiSessionRetentionDays?: number;
-  webServerEnabled?: boolean;
-  webServerPort?: number;
-  webServerHost?: string;
-  webServerAuthPassword?: string;
-  webServerAuthUsername?: string;
-  webServerApiToken?: string;
-  maxVectorsPerShard?: number;
-  autoCleanupEnabled?: boolean;
-  autoCleanupRetentionDays?: number;
-  deduplicationEnabled?: boolean;
-  deduplicationSimilarityThreshold?: number;
-  userProfileAnalysisInterval?: number;
-  userProfileMaxContextBytes?: number;
-  /**
-   * @deprecated No effect on the UI. Use userProfileInjectPreferences for LLM context only.
-   */
-  userProfileDisplayPreferences?: number;
-  /**
-   * @deprecated No effect on the UI. Use userProfileInjectPatterns for LLM context only.
-   */
-  userProfileDisplayPatterns?: number;
-  /**
-   * @deprecated No effect on the UI. Use userProfileInjectWorkflows for LLM context only.
-   */
-  userProfileDisplayWorkflows?: number;
-  userProfileStaleDays?: number;
-  userProfileInjectPreferences?: number;
-  userProfileInjectPatterns?: number;
-  userProfileInjectWorkflows?: number;
-  userProfileConfidenceDecayDays?: number;
-  userProfileChangelogRetentionCount?: number;
-  userProfileEmbeddingThresholdSameCat?: number;
-  userProfileEmbeddingThresholdSameCatWeak?: number;
-  userProfileEmbeddingThresholdCrossCat?: number;
-  userProfileEmbeddingThresholdCrossCatWeak?: number;
-  userProfileCentroidDriftThreshold?: number;
-  userProfileEmbeddingMinDescriptionLength?: number;
-  userProfileMinEvidenceForRetention?: number;
-  userProfileAutoCleanupEnabled?: boolean;
-  userProfileAutoCleanupInterval?: number;
-  userProfileValidationEnabled?: boolean;
-  showAutoCaptureToasts?: boolean;
-  showUserProfileToasts?: boolean;
-  showErrorToasts?: boolean;
-  /**
-   * Hex encryption key for local DB at rest (32 or 64 hex chars), or a secret
-   * ref (`env://`, `file://`). Prefer file:// / env:// — never commit keys.
-   * When `databaseEncryptionEnabled` is true and this is unset, the plugin
-   * auto-creates `~/.config/opencode/opencode-mem-db.key` (chmod 600).
-   */
+export interface CortexConfig {
+  /** Directory holding the per-project databases, logs and model cache. */
+  storagePath: string;
+  embeddingModel: string;
+  /** transformers.js ONNX dtype. The quantized weights are the default. */
+  embeddingDtype: "fp32" | "fp16" | "q8" | "int8" | "uint8" | "q4" | "q4f16" | "bnb4";
+  embeddingDimensions: number;
+  /** Optional Turso database encryption. Disabled by default. */
+  databaseEncryptionEnabled: boolean;
+  /** 64-hex-character AES-256 key. Generated under storagePath when omitted. */
   databaseEncryptionKey?: string;
-  /** Opt-in local DB encryption at rest (AES-256-GCM by default). */
-  databaseEncryptionEnabled?: boolean;
-  /** Cipher for @tursodatabase/database encryption (default aes256gcm). */
-  databaseEncryptionCipher?:
-    | "aes128gcm"
-    | "aes256gcm"
-    | "aegis256"
-    | "aegis256x2"
-    | "aegis128l"
-    | "aegis128x2"
-    | "aegis128x4";
-  /** Automatically clear OpenCode's cached plugin install when a newer npm latest is available. */
-  autoUpdate?: boolean;
-  /**
-   * Self-heal a store whose Turso WAL index is stale (a leftover `-tshm`/`-shm`,
-   * often after a foreign writer or beside a 0-byte `-wal`): verify a copy of
-   * the main `.db`, move the *index* sidecars to `<storagePath>/recovery/`, then
-   * retry once. A non-empty `-wal` is left in place so the engine can rebuild
-   * its index from it. Recovery is serialised across processes with
-   * `<storagePath>/recovery/<dbstem>.lock`. Default true.
-   */
-  tursoAutoHeal?: boolean;
-  /**
-   * Open with Turso's experimental `multiprocess_wal` (Unix). Set false for
-   * single-owner mode, so a foreign process fails loudly with "database is
-   * locked" instead of writing into a divergent WAL. Default true.
-   */
-  tursoMultiprocessWal?: boolean;
-  compaction?: {
-    enabled?: boolean;
-    memoryLimit?: number;
-  };
-  chatMessage?: {
-    enabled?: boolean;
-    maxMemories?: number;
-    excludeCurrentSession?: boolean;
-    maxAgeDays?: number;
-    injectOn?: "first" | "always";
-    /**
-     * How auto-injected memories are selected.
-     * - recent: newest pinned/recency listing (legacy)
-     * - relevant: vector search against the current user prompt (default)
-     * - both: relevant first, then fill remaining slots with recent
-     */
-    recall?: "recent" | "relevant" | "both";
-    /**
-     * Scope for auto-recall search/list. "default" follows memory.defaultScope.
-     */
-    recallScope?: "project" | "all-projects" | "default";
-    /** Optional override of top-level similarityThreshold for relevant recall. */
-    similarityThreshold?: number;
-    filterInjectedPrompts?: boolean;
-    injectionMarkers?: string[];
-    /**
-     * Capture "user" prompts from orchestrator child sessions (sessions with
-     * a parentID, e.g. OpenCode task/subagent). Default false: those prompts
-     * are written by the parent agent, not the human, and would train
-     * auto-capture / profile learning on the orchestrator's style.
-     */
-    captureChildSessions?: boolean;
-  };
-  /**
-   * Opt-in background memory consolidation ("dreaming"): merge near-duplicate
-   * memories via the configured LLM and soft-delete superseded rows into trash.
-   * `enabled` controls only the scheduled background pass; the web UI / API
-   * manual trigger still runs when false.
-   */
-  dreaming?: {
-    enabled?: boolean;
-    intervalHours?: number;
-    maxGroupsPerRun?: number;
-    trashRetentionDays?: number;
-    /**
-     * Similarity floor for related (not only near-duplicate) dreaming groups.
-     * Default 0.75. Independent of deduplicationSimilarityThreshold.
-     */
-    relatedThreshold?: number;
-    /**
-     * Allow grouping across project container tags. Also effective when
-     * memory.defaultScope is "all-projects". User-scope stays separate.
-     */
-    crossProject?: boolean;
-  };
+  databaseEncryptionCipher: EncryptionCipher;
+  /** Cosine similarity at or above this value rejects an add as a duplicate. */
+  dedupRejectThreshold: number;
+  /** Cosine similarity at or above this value adds the entry with a hint. */
+  dedupHintThreshold: number;
+  /** Extra regular expressions rejected in title/content/related_files/source_ref. */
+  blockedPatterns: string[];
+  /** Provider id used by stage 2 extraction, e.g. "anthropic". */
+  opencodeProvider?: string;
+  /** Model id used by stage 2 extraction. "inherit" follows the host default. */
+  opencodeModel?: string;
 }
 
-const DEFAULTS: Required<
-  Omit<
-    OpenCodeMemConfig,
-    | "embeddingApiUrl"
-    | "embeddingApiKey"
-    | "embeddingQueryPrefix"
-    | "embeddingDocumentPrefix"
-    | "embeddingDtype"
-    | "memoryModel"
-    | "memoryApiUrl"
-    | "memoryApiKey"
-    | "memoryProvider"
-    | "memoryTemperature"
-    | "forceToolChoice"
-    | "memoryExtraParams"
-    | "opencodeProvider"
-    | "opencodeModel"
-    | "opencodeVariant"
-    | "opencodeTimeoutMs"
-    | "autoCaptureLanguage"
-    | "userEmailOverride"
-    | "userNameOverride"
-    | "webServerAuthPassword"
-    | "webServerAuthUsername"
-    | "webServerApiToken"
-    | "databaseEncryptionKey"
-    | "markdownPath"
-  >
-> & {
-  embeddingApiUrl?: string;
-  embeddingApiKey?: string;
-  embeddingQueryPrefix?: string;
-  embeddingDocumentPrefix?: string;
-  embeddingDtype?: string;
-  memoryModel?: string;
-  memoryApiUrl?: string;
-  memoryApiKey?: string;
-  memoryProvider?:
-    | "atlas-cloud"
-    | "api-route"
-    | "cheaper-inference"
-    | "openai-chat"
-    | "openai-responses"
-    | "anthropic"
-    | "minimax"
-    | "orcarouter"
-    | "runcrate"
-    | "cloudgpu"
-    | "standardcompute";
-  memoryTemperature?: number | false;
-  forceToolChoice?: boolean;
-  memoryExtraParams?: Record<string, unknown>;
-  opencodeProvider?: string;
-  opencodeModel?: string;
-  opencodeVariant?: string;
-  opencodeTimeoutMs?: number;
-  autoCaptureLanguage?: string;
-  userEmailOverride?: string;
-  userNameOverride?: string;
-  webServerAuthPassword?: string;
-  webServerAuthUsername?: string;
-  webServerApiToken?: string;
-  databaseEncryptionKey?: string;
-  markdownPath?: string;
-  memory?: {
-    defaultScope?: "project" | "all-projects";
-  };
-} = {
-  storagePath: join(DATA_DIR, "data"),
-  memoryBackend: "database",
-  embeddingModel: "Xenova/nomic-embed-text-v1",
-  embeddingDimensions: 768,
-  embeddingUseTaskPrefixes: false,
-  embeddingPooling: "mean",
-  embeddingIdleTimeoutMs: 0,
-  similarityThreshold: 0.6,
-  maxMemories: 10,
-  // Deprecated compatibility value; not used for profile selection.
-  maxProfileItems: 5,
-  injectProfile: true,
-  containerTagPrefix: "opencode",
-  autoCaptureEnabled: true,
-  autoCaptureMaxIterations: 5,
-  autoCaptureIterationTimeout: 30000,
-  autoCaptureMaxRetries: 3,
-  autoCaptureMaxContextBytes: 131072,
-  autoCaptureProviderOrder: "opencode-first",
-  updateOnCaptureEnabled: false,
-  updateOnCaptureSimilarityThreshold: 0.75,
-  updateOnCaptureMaxCandidates: 5,
-  aiSessionRetentionDays: 7,
-  webServerEnabled: true,
-  webServerPort: 4747,
-  webServerHost: "127.0.0.1",
-  maxVectorsPerShard: 50000,
-  autoCleanupEnabled: true,
-  autoCleanupRetentionDays: 30,
-  deduplicationEnabled: true,
-  deduplicationSimilarityThreshold: 0.9,
-  userProfileAnalysisInterval: 10,
-  userProfileMaxContextBytes: 32768,
-  // Deprecated compatibility values; not used by the UI.
-  userProfileDisplayPreferences: 20,
-  userProfileDisplayPatterns: 15,
-  userProfileDisplayWorkflows: 10,
-  userProfileStaleDays: 2,
-  userProfileInjectPreferences: 5,
-  userProfileInjectPatterns: 5,
-  userProfileInjectWorkflows: 3,
-  userProfileConfidenceDecayDays: 30,
-  userProfileChangelogRetentionCount: 5,
-  userProfileEmbeddingThresholdSameCat: 0.8,
-  userProfileEmbeddingThresholdSameCatWeak: 0.5,
-  userProfileEmbeddingThresholdCrossCat: 0.9,
-  userProfileEmbeddingThresholdCrossCatWeak: 0.8,
-  userProfileCentroidDriftThreshold: 0.65,
-  userProfileEmbeddingMinDescriptionLength: 5,
-  userProfileMinEvidenceForRetention: 3,
-  userProfileAutoCleanupEnabled: true,
-  userProfileAutoCleanupInterval: 100,
-  userProfileValidationEnabled: false,
-  showAutoCaptureToasts: true,
-  showUserProfileToasts: true,
-  showErrorToasts: true,
+const DEFAULTS: CortexConfig = {
+  storagePath: DEFAULT_STORAGE_PATH,
+  embeddingModel: DEFAULT_EMBEDDING_MODEL,
+  embeddingDtype: "q8",
+  embeddingDimensions: DEFAULT_EMBEDDING_DIMENSIONS,
   databaseEncryptionEnabled: false,
   databaseEncryptionCipher: "aes256gcm",
-  autoUpdate: true,
-  tursoAutoHeal: true,
-  tursoMultiprocessWal: true,
-  memory: {
-    defaultScope: "project",
-  },
-  compaction: {
-    enabled: true,
-    memoryLimit: 10,
-  },
-  chatMessage: {
-    enabled: true,
-    maxMemories: 3,
-    excludeCurrentSession: true,
-    maxAgeDays: undefined,
-    injectOn: "first",
-    recall: "relevant",
-    recallScope: "default",
-    similarityThreshold: undefined,
-    filterInjectedPrompts: true,
-    injectionMarkers: [...getDefaultInjectionMarkers()],
-    captureChildSessions: false,
-  },
-  dreaming: {
-    enabled: false,
-    intervalHours: 24,
-    maxGroupsPerRun: 5,
-    trashRetentionDays: 30,
-    relatedThreshold: 0.75,
-    crossProject: false,
-  },
+  dedupRejectThreshold: 0.92,
+  dedupHintThreshold: 0.85,
+  blockedPatterns: [],
 };
 
-function expandPath(path: string): string {
-  if (path.startsWith("~/")) {
-    return join(homedir(), path.slice(2));
+const DTYPES = new Set(["fp32", "fp16", "q8", "int8", "uint8", "q4", "q4f16", "bnb4"]);
+const CIPHERS = new Set([
+  "aes128gcm",
+  "aes256gcm",
+  "aegis256",
+  "aegis256x2",
+  "aegis128l",
+  "aegis128x2",
+  "aegis128x4",
+]);
+
+function readJsonc(path: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(stripJsoncComments(readFileSync(path, "utf-8")));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("顶层必须是 JSON 对象");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `无法读取配置 ${path}: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
-  if (path === "~") {
-    return homedir();
-  }
+}
+
+function expandHome(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
   return path;
 }
 
-function normalizeMemoryBackend(value: unknown): "database" | "markdown" {
-  if (value === "markdown") return "markdown";
-  return "database";
+function stringField(raw: Record<string, unknown>, key: string, fallback: string): string {
+  const value = raw[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`配置项 ${key} 必须是非空字符串`);
+  }
+  return value.trim();
 }
 
-function loadConfigFromPaths(paths: string[]): OpenCodeMemConfig {
-  for (const path of paths) {
-    if (existsSync(path)) {
-      try {
-        const content = readFileSync(path, "utf-8");
-        const json = stripJsoncComments(content);
-        return JSON.parse(json) as OpenCodeMemConfig;
-      } catch {
-        // ignore unreadable or invalid config files
-      }
-    }
-  }
-  return {};
-}
-
-const GLOBAL_ONLY_REMOTE_PROVIDER_FIELDS: ReadonlyArray<keyof OpenCodeMemConfig> = [
-  "embeddingApiUrl",
-  "embeddingApiKey",
-  "memoryProvider",
-  "memoryApiUrl",
-  "memoryApiKey",
-];
-
-function assertProjectRemoteProviderConfigIsSafe(projectConfig: OpenCodeMemConfig): void {
-  const configuredFields = GLOBAL_ONLY_REMOTE_PROVIDER_FIELDS.filter((field) =>
-    Object.prototype.hasOwnProperty.call(projectConfig, field)
-  );
-
-  if (configuredFields.length > 0) {
-    throw new Error(
-      `Project config cannot set remote provider fields: ${configuredFields.join(", ")}. ` +
-        `Move them to the global config at ${CONFIG_FILES[0]}.`
-    );
-  }
-}
-
-const CONFIG_TEMPLATE = `{
-  // ============================================
-  // OpenCode Memory Plugin Configuration
-  // ============================================
-  
-  // Storage location for vector database (and search index when using markdown backend)
-  "storagePath": "~/.opencode-mem/data",
-
-  // Memory persistence: "database" (default) or "markdown"
-  // "memoryBackend": "markdown",
-  // "markdownPath": "~/Documents/LLM-Wiki",
-
-  "userEmailOverride": "",
-  "userNameOverride": "",
-  
-  // ============================================
-  // Embedding Model (for similarity search)
-  // ============================================
-  // Local = Hugging Face / ONNX via @huggingface/transformers (not Apple MLX).
-  // Remote = set BOTH embeddingApiUrl and embeddingApiKey (OpenAI-compatible /embeddings).
-  
-  // Default: Nomic Embed v1 (768 dimensions, 8192 context, multilingual)
-  "embeddingModel": "Xenova/nomic-embed-text-v1",
-
-  // Opt-in Nomic task prefixes (search_document: / search_query:). After enabling,
-  // re-index existing memories so store and query vectors stay aligned.
-  // "embeddingUseTaskPrefixes": true,
-
-  // Local pooling: "mean" (default) | "cls" | "last_token".
-  // Unset → model preset (bge-m3=cls, Qwen3-Embedding=last_token) or "mean".
-  // "embeddingPooling": "mean",
-
-  // Custom task prefixes (override presets / Nomic). Explicit "" disables a side.
-  // Changing pooling or prefixes requires re-embedding stored memories.
-  // "embeddingQueryPrefix": "query: ",
-  // "embeddingDocumentPrefix": "passage: ",
-
-  // Optional local ONNX dtype override (e.g. "q8", "fp32"). When unset, transformers.js defaults apply.
-  // "embeddingDtype": "q8",
-
-  // Release the local model after this many ms without embedding work.
-  // 0 (default) keeps it loaded for the whole process lifetime.
-  // "embeddingIdleTimeoutMs": 600000,
-  
-  // Auto-detected dimensions (no need to set manually)
-  // "embeddingDimensions": 768,
-  
-  // Other recommended local models:
-  // "embeddingModel": "Xenova/jina-embeddings-v2-base-en",  // 768 dims, English-only, 8192 context
-  // "embeddingModel": "Xenova/jina-embeddings-v2-small-en", // 512 dims, faster, 8192 context
-  // "embeddingModel": "Xenova/all-MiniLM-L6-v2",            // 384 dims, very fast, 512 context
-  // "embeddingModel": "Xenova/all-mpnet-base-v2",           // 768 dims, good quality, 512 context
-  // "embeddingModel": "Xenova/bge-m3",                      // 1024 dims, CLS pooling (auto)
-  // "embeddingModel": "intfloat/multilingual-e5-large",     // 1024 dims, query:/passage: prefixes (auto)
-  
-  // Optional: OpenAI-compatible API for embeddings (both URL and key required)
-  // "embeddingApiUrl": "https://api.openai.com/v1",
-  // "embeddingApiKey": "env://OPENAI_API_KEY",  // or "sk-..." / "file:///path/to/key"
-  // "embeddingModel": "text-embedding-3-small",  // 1536 dims, auto-detected
- 
-  // ============================================
-  // Web Server Settings
-  // ============================================
-  
-  // Enable web UI for managing memories (accessible at http://localhost:4747)
-  "webServerEnabled": true,
-  
-  // Port for web UI server
-  "webServerPort": 4747,
-  
-  // Host address for web UI (use 127.0.0.1 for local only, 0.0.0.0 for network access)
-  "webServerHost": "127.0.0.1",
-
-  // Optional HTTP Basic Auth for the web UI. Accepts literal, env://, or file:// secrets.
-  // "webServerAuthPassword": "",
-  // "webServerAuthUsername": "",
-
-  // Required when webServerHost is not loopback. Protects /api/* with Bearer / X-Opencode-Mem-Token.
-  // "webServerApiToken": "env://OPENCODE_MEM_WEB_TOKEN",
-  
-  // ============================================
-  // Database Settings
-  // ============================================
-  
-  // Maximum vectors per database shard (auto-creates new shard when limit reached)
-  "maxVectorsPerShard": 50000,
-  
-  // Automatically delete old memories based on retention period
-  "autoCleanupEnabled": true,
-  
-  // Days to keep memories before auto-cleanup (only if autoCleanupEnabled is true)
-  "autoCleanupRetentionDays": 30,
-  
-  // Automatically detect and remove duplicate memories
-  "deduplicationEnabled": true,
-  
-   // Similarity threshold (0-1) for detecting duplicates (higher = stricter)
-   "deduplicationSimilarityThreshold": 0.90,
-   
-  // ============================================
-  // Memory Scope Settings
-  // ============================================
-
-  // Default scope for memory list/search queries
-  // "project" keeps queries within the current project, "all-projects" searches across all project shards
-  "memory": {
-    "defaultScope": "project"
-  },
-
-  // ============================================
-  // OpenCode Provider Settings (RECOMMENDED)
-  // ============================================
-
-   // Use any provider that is already authenticated in opencode for auto-capture
-   // and user profile learning. The plugin calls opencode's session.prompt API
-   // (with structured output) instead of talking to provider HTTPS endpoints
-   // directly, so opencode owns the auth, token refresh, and provider routing.
-   //
-   // No separate API key is needed in this plugin — whatever you configured in
-   // opencode (OAuth like Claude Pro/Max, GitHub Copilot personal/business,
-   // bring-your-own API key, custom provider, ...) just works.
-   //
-   // If NOT set, falls back to the manual config (memoryApiKey/memoryApiUrl/memoryModel below).
-   //
-   // Examples (the provider name must be one returned by 'opencode providers list'):
-   //   Anthropic (OAuth/API key): "opencodeProvider": "anthropic",      "opencodeModel": "claude-haiku-4-5-20251001"
-   //   OpenAI (API key):          "opencodeProvider": "openai",          "opencodeModel": "gpt-4o-mini"
-   //   GitHub Copilot:            "opencodeProvider": "github-copilot",  "opencodeModel": "gpt-4o-mini"
-   //   OpenRouter:                "opencodeProvider": "openrouter",      "opencodeModel": "…"
-   //
-   // Avoid pinning the built-in Free provider "opencode" (e.g. big-pickle) for
-   // auto-capture: those models are often restricted to interactive OpenCode
-   // chat and fail on the plugin's internal structured-output sessions. Prefer
-   // an authenticated provider above, or "opencodeModel": "inherit".
-   //
-   // "opencodeProvider": "anthropic",
-   // "opencodeModel": "claude-haiku-4-5-20251001",
-   // Optional model reasoning variant for internal LLM calls (e.g. "xhigh");
-   // also applies when opencodeModel is "inherit":
-   // "opencodeVariant": "xhigh",
-   // Optional timeout in milliseconds for the plugin's internal structured-output LLM calls
-   // (auto-capture summaries, profile learning; default 90000, clamped to 10000..600000;
-   // invalid values fall back to the default; numeric strings are coerced):
-   // "opencodeTimeoutMs": 180000,
-
-   // ============================================
-   // Auto-Capture Settings
-   // ============================================
-  
-  // IMPORTANT: Auto-capture only runs after either opencodeProvider/opencodeModel
-  // above is configured, or the manual fallback below is uncommented with real values.
-  // If autoCaptureEnabled is true but neither path is ready, the plugin shows a
-  // startup warning toast (when showErrorToasts is true).
-  // It runs in background without blocking your main session
-  // Note: Ollama may not support tool calling. Use OpenAI, Anthropic, or Groq for best results.
-  
-  "autoCaptureEnabled": true,
-
-  // Opt-in: before saving a new auto-capture memory, search for similar entries
-  // and let the model choose add / update / supersede (old rows go to trash).
-  // "updateOnCaptureEnabled": true,
-  // "updateOnCaptureSimilarityThreshold": 0.75,
-  // "updateOnCaptureMaxCandidates": 5,
-  
-  // Provider type: "api-route" | "atlas-cloud" | "cheaper-inference" | "openai-chat" | "openai-responses" | "anthropic" | "minimax" | "orcarouter" | "runcrate" | "cloudgpu" | "standardcompute"
-  // Note: "openai-chat" is a generic OpenAI API-compatible mode.
-  // Any service that follows the OpenAI Chat Completions API can use it via custom "memoryApiUrl".
-  "memoryProvider": "openai-chat",
-  
-  // Manual fallback. Uncomment all 3 lines and replace memoryApiKey before use:
-  // "memoryModel": "gpt-4o-mini",
-  // "memoryApiUrl": "https://api.openai.com/v1",
-  // "memoryApiKey": "sk-...",
-
-  // API Key Formats:
-  // Direct value:        "sk-..."
-  // From file:           "file://~/.config/litellm-key.txt"
-  // From env variable:   "env://LITELLM_API_KEY"
-  
-  // Examples for different providers:
-  // Any OpenAI-compatible endpoint can use the "openai-chat" provider pattern below.
-  // Common examples: DeepSeek, Qwen (via Alibaba Cloud ModelStudio),
-  // Zhipu GLM (BigModel platform), and Kimi (Moonshot AI platform).
-
-  // OpenAI Chat Completion (default, backward compatible):
-  //   "memoryProvider": "openai-chat"
-  //   "memoryModel": "gpt-4o-mini"
-  //   "memoryApiUrl": "https://api.openai.com/v1"
-  //   "memoryApiKey": "sk-..."
-
-  // DeepSeek (OpenAI-compatible example):
-  //   "memoryProvider": "openai-chat"
-  //   "memoryModel": "deepseek-chat"
-  //   "memoryApiUrl": "https://api.deepseek.com/v1"
-  //   "memoryApiKey": "sk-..."
-  
-  // OpenAI Responses API (recommended, with session support):
-  //   "memoryProvider": "openai-responses"
-  //   "memoryModel": "gpt-4o"
-  //   "memoryApiUrl": "https://api.openai.com/v1"
-  //   "memoryApiKey": "sk-..."
-  
-  // Anthropic (with session support):
-  //   "memoryProvider": "anthropic"
-  //   "memoryModel": "claude-3-5-haiku-20241022"
-  //   "memoryApiUrl": "https://api.anthropic.com/v1"
-  //   "memoryApiKey": "sk-ant-..."
-
-  // MiniMax (Anthropic Messages-compatible endpoint, with session support):
-  //   "memoryProvider": "minimax"
-  //   "memoryModel": "MiniMax-M3.1-Flash"          // 1,000,000-token context; thinking always on
-  //   // Alternative: "MiniMax-M3"                  // 1,000,000-token context; thinking off by default
-  //   "memoryApiUrl": "https://api.minimax.io"        // global endpoint
-  //   "memoryApiKey": "<MiniMax API key>"
-  //   // China endpoint: "memoryApiUrl": "https://api.minimax.cn"
-  //   // Flash effort: low | medium | high | xhigh | max (default). Do not disable thinking.
-  //   "memoryExtraParams": { "output_config": { "effort": "max" } }
-  //   // For MiniMax-M3, optionally use { "thinking": { "type": "adaptive" } } instead.
-
-  // OrcaRouter (OpenAI-compatible gateway, namespaced model IDs, with session support):
-  //   "memoryProvider": "orcarouter"
-  //   "memoryApiKey": "<OrcaRouter API key>"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://api.orcarouter.ai/v1 and "orcarouter/auto" (a routing alias).
-  //   // OrcaRouter rejects bare model names, so if you set memoryModel, use a
-  //   // namespaced ID such as "openai/gpt-5.5" or "deepseek/deepseek-v4-flash".
-  //   "memoryModel": "openai/gpt-5.5"
-
-  // Atlas Cloud (OpenAI-compatible Chat Completions preset, with session support):
-  //   "memoryProvider": "atlas-cloud"
-  //   "memoryApiKey": "env://ATLASCLOUD_API_KEY"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://api.atlascloud.ai/v1 and "deepseek-ai/deepseek-v4-pro".
-  //   // When selected, auto-capture/profile prompts, responses, and relevant
-  //   // conversation context are sent to api.atlascloud.ai.
-  //   // "memoryModel": "deepseek-ai/deepseek-v4-pro"
-
-  // Cheaper Inference (OpenAI-compatible Chat Completions preset, with session support):
-  //   "memoryProvider": "cheaper-inference"
-  //   "memoryApiKey": "env://CHEAPER_INFERENCE_API_KEY"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://api.cheaperinference.com/v1 and "gpt-5.4-mini".
-  //   // When selected, auto-capture/profile prompts, responses, and relevant
-  //   // conversation context are sent to api.cheaperinference.com.
-  //   // "memoryModel": "gpt-5.4-mini"
-
-  // API Route (OpenAI-compatible Chat Completions preset, with session support):
-  //   "memoryProvider": "api-route"
-  //   "memoryApiKey": "env://API_ROUTE_API_KEY"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://global.api-route.com/v1 and "gpt-6.1-sol".
-  //   // When selected, auto-capture/profile prompts, responses, and relevant
-  //   // conversation context are sent to global.api-route.com.
-  //   // "memoryModel": "gpt-6.1-sol"
-
-  // Runcrate (OpenAI-compatible Chat Completions preset, with session support):
-  //   "memoryProvider": "runcrate"
-  //   "memoryApiKey": "env://RUNCRATE_API_KEY"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://api.runcrate.ai/v1 and "deepseek-ai/DeepSeek-V4.1-Flash".
-  //   // When selected, auto-capture/profile prompts, responses, and relevant
-  //   // conversation context are sent to api.runcrate.ai.
-  //   // "memoryModel": "deepseek-ai/DeepSeek-V4.1-Flash"
-
-  // CloudGPU (OpenAI-compatible Chat Completions preset, with session support):
-  //   "memoryProvider": "cloudgpu"
-  //   "memoryApiKey": "env://CLOUDGPU_API_KEY"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://cloudgpu.app/v1 and "deepseek-v4.1-flash".
-  //   // Create a key at https://cloudgpu.app/api/console (docs: https://cloudgpu.app/api/docs).
-  //   // When selected, auto-capture/profile prompts, responses, and relevant
-  //   // conversation context are sent to cloudgpu.app.
-  //   // "memoryModel": "deepseek-v4.1-flash"
-
-  // Standard Compute (OpenAI-compatible Chat Completions preset, with session support):
-  //   "memoryProvider": "standardcompute"
-  //   "memoryApiKey": "env://STANDARDCOMPUTE_API_KEY"
-  //   // memoryApiUrl and memoryModel are optional — they default to
-  //   // https://api.stdcmpt.com/v1 and "StandardCompute".
-  //   // Create a key at https://standardcompute.com/dashboard (docs: https://docs.standardcompute.com).
-  //   // When selected, auto-capture/profile prompts, responses, and relevant
-  //   // conversation context are sent to api.stdcmpt.com.
-  //   // "memoryModel": "StandardCompute"
-
-  // Groq (OpenAI-compatible, use openai-chat provider):
-  //   "memoryProvider": "openai-chat"
-  //   "memoryModel": "llama-3.3-70b-versatile"
-  //   "memoryApiUrl": "https://api.groq.com/openai/v1"
-  //   "memoryApiKey": "gsk_..."
-  
-  // Maximum iterations for multi-turn AI analysis (for openai-responses, anthropic, and minimax)
-  "autoCaptureMaxIterations": 5,
-   
-  // Timeout per iteration in milliseconds (30 seconds default)
-  "autoCaptureIterationTimeout": 30000,
-
-  // Maximum number of times to retry capturing a prompt if it fails (due to network, API errors, etc.)
-  "autoCaptureMaxRetries": 3,
-
-  // Maximum UTF-8 bytes for the auto-capture markdown context sent to the summary model.
-  // Prevents HTTP 400 context overflows on models with ~131K token windows (e.g. Groq Llama).
-  // Rough guide: tokens ≈ bytes / 4 for mixed code/prose.
-  "autoCaptureMaxContextBytes": 131072,
-
-  // When both opencodeProvider and manual memoryModel/memoryApiUrl are set, which
-  // channel to try first for auto-capture summaries. Default "opencode-first".
-  // Prefer "external-first" if the host session API is slow/busy (~15–50s) and
-  // you want the faster external API path (~3s). Failed primary falls back.
-  // Faster opencode failover also: lower "opencodeTimeoutMs" (default 90000).
-  // "autoCaptureProviderOrder": "external-first",
-   
-  // Days to keep AI session history before cleanup
-  "aiSessionRetentionDays": 7,
-
-  // Temperature for AI API requests (set to false to omit parameter for models that don't support it)
-  // Some reasoning models (like o1, o3, gpt-5) don't support temperature parameter
-  // Set to false and add "memoryTemperature": false in config when using such models
-  "memoryTemperature": 0.3,
-
-  // Force tool calls on openai-chat / orcarouter / atlas-cloud / cheaper-inference / api-route / runcrate / cloudgpu / standardcompute (tool_choice: "required"). Default true.
-  // Some thinking/reasoning models reject forced tool choice — set false to fall back to "auto":
-  // "forceToolChoice": false,
-
-  // Extra parameters to include in API request body
-  // Useful for local inference servers (e.g. llama-server with --jinja) that support
-  // additional parameters like disabling thinking/reasoning mode
-  // Example for Qwen3 models: { "enable_thinking": false }
-  // "memoryExtraParams": {},
-
-  // Language for auto-capture summaries and user profile learning (default: "auto" for auto-detection)
-  // Options: "auto", "en", "id", "zh", "ja", "es", "fr", "de", "ru", "pt", "ar", "ko"
-  // "autoCaptureLanguage": "auto",
-
-  // ============================================
-  // Toast Notifications
-  // ============================================
-
-  // Show toast when memory is auto-captured
-  "showAutoCaptureToasts": true,
-
-  // Show toast when user profile is updated
-  "showUserProfileToasts": true,
-
-  // Show toast for error messages
-  "showErrorToasts": true,
-
-  // Opt-in encryption at rest for local Turso DB shards (AES-256-GCM).
-  // When enabled without a key, the plugin creates
-  // ~/.config/opencode/opencode-mem-db.key (chmod 600) once.
-  // "databaseEncryptionEnabled": true,
-  // Optional override: "databaseEncryptionKey": "env://OPENCODE_MEM_DB_KEY",
-  // "databaseEncryptionCipher": "aes256gcm",
-
-  // Automatically update when installed as opencode-mem@latest (or a range).
-  // Pinned versions like opencode-mem@2.26.0 are never auto-updated.
-  "autoUpdate": true,
-
-  // Recover a store whose Turso WAL index is stale (a leftover -tshm/-shm, often
-  // beside a 0-byte -wal). The guard copies the main .db, verifies it with
-  // PRAGMA integrity_check, moves the -shm/-tshm index sidecars to
-  // <storagePath>/recovery/, and retries the open once. A non-empty -wal is
-  // never moved, so committed but uncheckpointed transactions are preserved.
-  // Recovery is serialised across processes by <storagePath>/recovery/<db>.lock.
-  "tursoAutoHeal": true,
-
-  // Turso experimental multiprocess_wal (Unix). Set false for single-owner mode:
-  // a second process then fails loudly with "database is locked" instead of
-  // writing into a divergent WAL. See issue #435.
-  "tursoMultiprocessWal": true,
-
-  // ============================================
-  // User Profile System
-  // ============================================
-
-  // Analyze user prompts every N prompts to build/update your user profile
-  // When N uncaptured prompts accumulate, AI will analyze them to identify:
-  // - User preferences (code style, communication style, tool preferences)
-  // - User patterns (recurring topics, problem domains, technical interests)
-  // - User workflows (development habits, sequences, learning style)
-  // - Skill level (overall and per-domain assessment)
-  "userProfileAnalysisInterval": 10,
-
-  // Days before inactive items (all types) are eligible for removal
-  "userProfileStaleDays": 2,
-
-  // Number of preferences injected into LLM conversation context
-  // Keep this small — the strongest signals are enough; more dilute LLM attention
-  "userProfileInjectPreferences": 5,
-  
-  // Number of patterns injected into LLM conversation context
-  "userProfileInjectPatterns": 5,
-  
-  // Number of workflows injected into LLM conversation context
-  "userProfileInjectWorkflows": 3,
-  
-  // Days before preference confidence starts to decay (if not reinforced)
-  // Preferences that aren't seen again will gradually lose confidence and be removed
-  "userProfileConfidenceDecayDays": 30,
-  
-  // Number of profile versions to keep in changelog (for rollback/debugging)
-  // Older versions are automatically cleaned up
-  "userProfileChangelogRetentionCount": 5,
-
-  // Minimum evidence count for a preference/pattern to survive confidence decay
-  // Items confirmed fewer times are more likely to be pruned when confidence decays
-  "userProfileMinEvidenceForRetention": 3,
-
-  // Periodically merge duplicate or irrelevant profile items with the configured AI provider
-  "userProfileAutoCleanupEnabled": true,
-  // Number of analyzed user prompts between automatic AI cleanup runs
-  "userProfileAutoCleanupInterval": 100,
-
-  // Enable LLM validation of existing preferences against recent behavior.
-  // When enabled, each analysis round checks if top-5 preferences still match recent prompts.
-  // Experimental — disabled by default.
-  "userProfileValidationEnabled": false,
-
-  // ============================================
-  // Search Settings
-  // ============================================
-  
-  // Minimum similarity score (0-1) for memory search results
-  "similarityThreshold": 0.6,
-
-  // Maximum number of memories to return in search results
-  "maxMemories": 10,
-
-  // ============================================
-  // Advanced Settings
-  // ============================================
-  
-  // Inject user profile into AI context (preferences, patterns, workflows)
-  "injectProfile": true,
-
-  // Chat message capture and injection behavior
-  "chatMessage": {
-    // How auto-injected memories are picked for the prompt context.
-    // "relevant" (default) embeds the user message and runs vector search.
-    // "recent" keeps the legacy newest-N listing. "both" prefers relevant,
-    // then fills remaining slots with recent memories.
-    "recall": "relevant",
-    // Scope for auto-recall. "default" follows memory.defaultScope above.
-    // "recallScope": "default",
-    // Optional similarity floor for relevant recall (else similarityThreshold).
-    // "similarityThreshold": 0.6,
-
-    // Skip prompt text injected by the host or by other OpenCode plugins
-    // (system reminders, orchestration directives, background-task
-    // notifications) so it is never stored as if the user had typed it.
-    // Disable only if you deliberately want that content memorized.
-    "filterInjectedPrompts": true,
-
-    // Capture prompts from orchestrator child sessions (sessions with a parentID,
-    // e.g. OpenCode task/subagent children). Their "user" messages are written
-    // by the parent agent, not by you, so default false means they are not
-    // stored, auto-captured, used for profile learning, or given memory
-    // context. Enable only if you deliberately want those prompts memorized.
-    "captureChildSessions": false
-
-    // Extra markers identifying injected blocks. These are ADDED to the
-    // built-in list, never replace it.
-    // "injectionMarkers": ["<my-plugin-banner>"]
-  },
-
-  // Opt-in background consolidation: merge/update/supersede related memories
-  // via the configured LLM and soft-delete superseded rows into trash.
-  // "enabled" gates only the scheduler; the Dream button / POST /api/dreaming/run
-  // still work when false (manual-only mode).
-  "dreaming": {
-    "enabled": false,
-    "intervalHours": 24,
-    "maxGroupsPerRun": 5,
-    "trashRetentionDays": 30,
-    // Related (not only near-duplicate) grouping floor; independent of
-    // deduplicationSimilarityThreshold (default 0.9).
-    "relatedThreshold": 0.75,
-    // Also effective when memory.defaultScope is "all-projects".
-    "crossProject": false
-  }
-}
-`;
-
-function ensureConfigExists(): void {
-  const configPath = join(CONFIG_DIR, "opencode-mem.jsonc");
-
-  if (!existsSync(configPath)) {
-    try {
-      writeFileSync(configPath, CONFIG_TEMPLATE, "utf-8");
-      console.log(`\n✓ Created config template: ${configPath}`);
-      console.log("  Edit this file to customize opencode-mem settings.\n");
-    } catch {
-      // ignore if the template cannot be written
-    }
-  }
-}
-
-ensureConfigExists();
-
-export type EmbeddingPooling = "mean" | "cls" | "last_token";
-
-export type EmbeddingModelPreset = {
-  pooling: EmbeddingPooling;
-  /**
-   * When present (including `""`), used as the default query/document prefix
-   * when the corresponding config key is unset. Omitting both keeps Nomic
-   * opt-in via `embeddingUseTaskPrefixes` (nomic models).
-   */
-  queryPrefix?: string;
-  documentPrefix?: string;
-};
-
-const QWEN3_EMBEDDING_QUERY_PREFIX =
-  "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ";
-
-/**
- * Known local embedding model presets (substring match on `embeddingModel`).
- * Explicit config keys always win over these defaults.
- */
-export function getEmbeddingModelPreset(model: string): EmbeddingModelPreset | undefined {
-  const id = model.toLowerCase();
-  if (id.includes("bge-m3")) {
-    return { pooling: "cls", queryPrefix: "", documentPrefix: "" };
-  }
-  if (id.includes("multilingual-e5") || id.includes("e5-")) {
-    return { pooling: "mean", queryPrefix: "query: ", documentPrefix: "passage: " };
-  }
-  if (id.includes("qwen3-embedding")) {
-    return {
-      pooling: "last_token",
-      queryPrefix: QWEN3_EMBEDDING_QUERY_PREFIX,
-      documentPrefix: "",
-    };
-  }
-  if (id.includes("jina-embeddings")) {
-    return { pooling: "mean", queryPrefix: "", documentPrefix: "" };
-  }
-  if (id.includes("nomic-embed")) {
-    return { pooling: "mean" };
-  }
-  return undefined;
-}
-
-export function normalizeEmbeddingPooling(value: unknown): EmbeddingPooling {
-  if (value === "mean" || value === "cls" || value === "last_token") return value;
-  throw new Error(
-    `Invalid embeddingPooling config: ${String(value)} (expected "mean" | "cls" | "last_token")`
-  );
-}
-
-/** Dtypes accepted by transformers.js `pipeline({ dtype })`. */
-export const LOCAL_ONNX_DTYPES = [
-  "auto",
-  "fp32",
-  "fp16",
-  "q8",
-  "int8",
-  "uint8",
-  "q4",
-  "bnb4",
-  "q4f16",
-  "q2",
-  "q2f16",
-  "q1",
-  "q1f16",
-] as const;
-
-export type LocalOnnxDtype = (typeof LOCAL_ONNX_DTYPES)[number];
-
-export function normalizeEmbeddingDtype(value: unknown): LocalOnnxDtype | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") {
-    throw new Error(`Invalid embeddingDtype config: ${String(value)}`);
-  }
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  if ((LOCAL_ONNX_DTYPES as readonly string[]).includes(trimmed)) {
-    return trimmed as LocalOnnxDtype;
-  }
-  throw new Error(
-    `Invalid embeddingDtype config: ${trimmed} (expected one of ${LOCAL_ONNX_DTYPES.join(", ")})`
-  );
-}
-
-export function normalizeEmbeddingIdleTimeoutMs(value: number): number {
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`Invalid embeddingIdleTimeoutMs config: ${String(value)}`);
-  }
+function booleanField(raw: Record<string, unknown>, key: string, fallback: boolean): boolean {
+  const value = raw[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") throw new Error(`配置项 ${key} 必须是布尔值`);
   return value;
 }
 
-function getEmbeddingDimensions(model: string): number {
-  const dimensionMap: Record<string, number> = {
-    // Local Xenova models
-    "Xenova/nomic-embed-text-v1": 768,
-    "Xenova/nomic-embed-text-v1-unsupervised": 768,
-    "Xenova/nomic-embed-text-v1-ablated": 768,
-    "Xenova/jina-embeddings-v2-base-en": 768,
-    "Xenova/jina-embeddings-v2-base-zh": 768,
-    "Xenova/jina-embeddings-v2-base-de": 768,
-    "Xenova/jina-embeddings-v2-small-en": 512,
-    "Xenova/all-MiniLM-L6-v2": 384,
-    "Xenova/all-MiniLM-L12-v2": 384,
-    "Xenova/all-mpnet-base-v2": 768,
-    "Xenova/bge-base-en-v1.5": 768,
-    "Xenova/bge-small-en-v1.5": 384,
-    "Xenova/bge-m3": 1024,
-    "Xenova/gte-small": 384,
-    "Xenova/GIST-small-Embedding-v0": 384,
-    "Xenova/text-embedding-ada-002": 1536,
-
-    // Other local / ONNX community models
-    "intfloat/multilingual-e5-large": 1024,
-    "intfloat/multilingual-e5-base": 768,
-    "intfloat/e5-large-v2": 1024,
-    "onnx-community/Qwen3-Embedding-0.6B-ONNX": 1024,
-
-    // OpenAI API models
-    "text-embedding-3-small": 1536,
-    "text-embedding-3-large": 3072,
-    "text-embedding-ada-002": 1536,
-
-    // Cohere API models
-    "embed-english-v3.0": 1024,
-    "embed-multilingual-v3.0": 1024,
-    "embed-english-light-v3.0": 384,
-    "embed-multilingual-light-v3.0": 384,
-
-    // Google API models
-    "text-embedding-004": 768,
-    "text-multilingual-embedding-002": 768,
-
-    // Voyage AI models
-    "voyage-3": 1024,
-    "voyage-3-lite": 512,
-    "voyage-code-3": 1024,
-  };
-  return dimensionMap[model] || 768;
-}
-
-export function normalizeAutoCaptureMaxContextBytes(value: number): number {
-  if (!Number.isInteger(value) || value < 16384 || value > 16 * 1024 * 1024) {
-    throw new Error(`Invalid autoCaptureMaxContextBytes config: ${value}`);
-  }
-  return value;
-}
-
-export type AutoCaptureProviderOrder = "opencode-first" | "external-first";
-
-/** Invalid / unset values fall back to the historical default (opencode-first). */
-export function normalizeAutoCaptureProviderOrder(value: unknown): AutoCaptureProviderOrder {
-  return value === "external-first" ? "external-first" : "opencode-first";
-}
-
-export function normalizeAutoCleanupRetentionDays(value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`Invalid autoCleanupRetentionDays config: ${value}`);
-  }
-  return value;
-}
-
-/**
- * Blank/whitespace-only opencodeVariant values are treated as unset so the
- * prompt bodies never carry an empty `variant` key.
- */
-function normalizeOpencodeVariant(value: string | undefined): string | undefined {
-  const trimmed = typeof value === "string" ? value.trim() : "";
-  return trimmed ? trimmed : undefined;
-}
-
-export const OPENCODE_TIMEOUT_MS_MIN = 10_000;
-export const OPENCODE_TIMEOUT_MS_MAX = 600_000;
-export const OPENCODE_TIMEOUT_MS_DEFAULT = 90_000;
-
-/**
- * Structured-output prompt timeout: non-number/non-finite values fall back to
- * the default (numeric strings are coerced first), otherwise the value is
- * clamped to [OPENCODE_TIMEOUT_MS_MIN, OPENCODE_TIMEOUT_MS_MAX].
- */
-export function normalizeOpencodeTimeoutMs(value: unknown): number {
-  let numeric = value;
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (trimmed.length === 0) return OPENCODE_TIMEOUT_MS_DEFAULT;
-    numeric = Number(trimmed);
-  }
-  if (typeof numeric !== "number" || !Number.isFinite(numeric)) {
-    return OPENCODE_TIMEOUT_MS_DEFAULT;
-  }
-  return Math.min(OPENCODE_TIMEOUT_MS_MAX, Math.max(OPENCODE_TIMEOUT_MS_MIN, numeric));
-}
-
-/**
- * Margin added to the configured structured-output timeout for the outer
- * safety-net races around generateStructuredOutput calls: the inner, more
- * informative provider timeout always fires first.
- */
-export const OPENCODE_TIMEOUT_OUTER_MARGIN_MS = 30_000;
-
-/**
- * Outer safety-net timeout wrapping one structured-output call, derived from
- * the configured timeout plus a fixed margin.
- */
-export function outerStructuredOutputTimeoutMs(configured: number | undefined): number {
-  return (configured ?? OPENCODE_TIMEOUT_MS_DEFAULT) + OPENCODE_TIMEOUT_OUTER_MARGIN_MS;
-}
-
-export function normalizeChatMessageRecall(value: unknown): "recent" | "relevant" | "both" {
-  if (value === "recent" || value === "relevant" || value === "both") return value;
-  return "relevant";
-}
-
-export function normalizeChatMessageRecallScope(
-  value: unknown
-): "project" | "all-projects" | "default" {
-  if (value === "project" || value === "all-projects" || value === "default") return value;
-  return "default";
-}
-
-export function normalizeDreamingIntervalHours(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return 24;
-  }
-  return Math.max(1, Math.trunc(value));
-}
-
-export function normalizeDreamingMaxGroupsPerRun(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return 5;
-  }
-  return Math.max(1, Math.trunc(value));
-}
-
-export function normalizeDreamingTrashRetentionDays(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-    return 30;
-  }
-  return value;
-}
-
-export function normalizeSimilarityUnitInterval(value: unknown, fallback: number): number {
+function numberField(raw: Record<string, unknown>, key: string, fallback: number): number {
+  const value = raw[key];
+  if (value === undefined) return fallback;
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    return fallback;
+    throw new Error(`配置项 ${key} 必须是数字`);
   }
-  if (value < 0) return 0;
-  if (value > 1) return 1;
   return value;
 }
 
-export function normalizeUpdateOnCaptureMaxCandidates(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return 5;
-  }
-  return Math.max(1, Math.min(20, Math.trunc(value)));
+function thresholdField(raw: Record<string, unknown>, key: string, fallback: number): number {
+  const value = numberField(raw, key, fallback);
+  if (value < 0 || value > 1) throw new Error(`配置项 ${key} 必须在 0 到 1 之间`);
+  return value;
 }
 
-export function normalizeDreamingRelatedThreshold(value: unknown): number {
-  return normalizeSimilarityUnitInterval(value, 0.75);
-}
+/** Load global config, then apply the project config as overrides. */
+export function loadConfig(directory: string): CortexConfig {
+  const globalRaw = existsSync(GLOBAL_CONFIG_PATH) ? readJsonc(GLOBAL_CONFIG_PATH) : {};
+  const projectPath = join(resolve(directory), ".opencode", "opencode-cortex.jsonc");
+  const projectRaw = existsSync(projectPath) ? readJsonc(projectPath) : {};
 
-/**
- * User-supplied markers extend the built-in set rather than replacing it, so
- * adding one marker cannot silently disable protection against all the others.
- */
-export function normalizeInjectionMarkers(value: string[] | undefined): string[] {
-  const defaults = getDefaultInjectionMarkers();
-  if (value === undefined) return [...defaults];
-  if (!Array.isArray(value)) {
-    throw new Error(`Invalid chatMessage.injectionMarkers config: expected an array`);
-  }
-
-  const merged = [...defaults];
-  for (const marker of value) {
-    if (typeof marker !== "string") {
-      throw new Error(
-        `Invalid chatMessage.injectionMarkers entry: expected a string, got ${typeof marker}`
-      );
-    }
-    const trimmed = marker.trim();
-    if (!trimmed) continue;
-    if (!merged.some((existing) => existing.toLowerCase() === trimmed.toLowerCase())) {
-      merged.push(trimmed);
-    }
-  }
-  return merged;
-}
-
-function buildConfig(fileConfig: OpenCodeMemConfig) {
-  const memoryProvider = (fileConfig.memoryProvider ?? "openai-chat") as
-    | "atlas-cloud"
-    | "api-route"
-    | "cheaper-inference"
-    | "openai-chat"
-    | "openai-responses"
-    | "anthropic"
-    | "minimax"
-    | "orcarouter"
-    | "runcrate"
-    | "cloudgpu"
-    | "standardcompute";
-  const memoryApiKey =
-    resolveSecretValue(fileConfig.memoryApiKey) ??
-    (memoryProvider === "atlas-cloud"
-      ? process.env.ATLASCLOUD_API_KEY
-      : memoryProvider === "cheaper-inference"
-        ? process.env.CHEAPER_INFERENCE_API_KEY
-        : memoryProvider === "api-route"
-          ? process.env.API_ROUTE_API_KEY
-          : memoryProvider === "runcrate"
-            ? process.env.RUNCRATE_API_KEY
-            : memoryProvider === "cloudgpu"
-              ? process.env.CLOUDGPU_API_KEY
-              : memoryProvider === "standardcompute"
-                ? process.env.STANDARDCOMPUTE_API_KEY
-                : undefined);
-  // Preset providers advertise optional memoryModel / memoryApiUrl in docs and
-  // factory code, but auto-capture / dreaming / profile learning gate on the
-  // resolved CONFIG fields. Fill preset defaults here so key-only configs work.
-  const presetDefaults = resolveMemoryProviderPresetDefaults(memoryProvider);
-  const memoryModel =
-    (typeof fileConfig.memoryModel === "string" ? fileConfig.memoryModel.trim() : "") ||
-    presetDefaults?.model;
-  const memoryApiUrl =
-    (typeof fileConfig.memoryApiUrl === "string" ? fileConfig.memoryApiUrl.trim() : "") ||
-    presetDefaults?.apiUrl;
-  const embeddingModel = fileConfig.embeddingModel ?? DEFAULTS.embeddingModel;
-  const embeddingPreset = getEmbeddingModelPreset(embeddingModel);
-  const embeddingDimensions =
-    fileConfig.embeddingDimensions ?? getEmbeddingDimensions(embeddingModel);
-  const embeddingPooling = normalizeEmbeddingPooling(
-    fileConfig.embeddingPooling ?? embeddingPreset?.pooling ?? DEFAULTS.embeddingPooling
-  );
-  const embeddingQueryPrefix =
-    fileConfig.embeddingQueryPrefix !== undefined
-      ? fileConfig.embeddingQueryPrefix
-      : embeddingPreset?.queryPrefix;
-  const embeddingDocumentPrefix =
-    fileConfig.embeddingDocumentPrefix !== undefined
-      ? fileConfig.embeddingDocumentPrefix
-      : embeddingPreset?.documentPrefix;
-  const embeddingDtype = normalizeEmbeddingDtype(fileConfig.embeddingDtype);
-  const embeddingIdleTimeoutMs = normalizeEmbeddingIdleTimeoutMs(
-    fileConfig.embeddingIdleTimeoutMs ?? DEFAULTS.embeddingIdleTimeoutMs
-  );
-  const autoCaptureMaxContextBytes = normalizeAutoCaptureMaxContextBytes(
-    fileConfig.autoCaptureMaxContextBytes ?? DEFAULTS.autoCaptureMaxContextBytes
-  );
-  const userProfileAutoCleanupInterval =
-    fileConfig.userProfileAutoCleanupInterval ?? DEFAULTS.userProfileAutoCleanupInterval;
-
-  if (
-    !Number.isInteger(embeddingDimensions) ||
-    embeddingDimensions <= 0 ||
-    embeddingDimensions > 65536
-  ) {
-    throw new Error(`Invalid embeddingDimensions config: ${embeddingDimensions}`);
-  }
-  if (!Number.isInteger(userProfileAutoCleanupInterval) || userProfileAutoCleanupInterval <= 0) {
+  if (Object.prototype.hasOwnProperty.call(projectRaw, "databaseEncryptionKey")) {
     throw new Error(
-      `Invalid userProfileAutoCleanupInterval config: ${userProfileAutoCleanupInterval}`
+      `项目配置 ${projectPath} 不能设置 databaseEncryptionKey，请放到全局配置 ${GLOBAL_CONFIG_PATH}`
     );
   }
 
-  const memoryBackend = normalizeMemoryBackend(fileConfig.memoryBackend);
-  const markdownPathRaw =
-    typeof fileConfig.markdownPath === "string" ? fileConfig.markdownPath.trim() : "";
-  const markdownPath = markdownPathRaw ? expandPath(markdownPathRaw) : undefined;
-  if (memoryBackend === "markdown" && !markdownPath) {
-    throw new Error('memoryBackend "markdown" requires markdownPath to be set');
-  }
-
-  return {
-    storagePath: expandPath(fileConfig.storagePath ?? DEFAULTS.storagePath),
-    memoryBackend,
-    markdownPath,
-    userEmailOverride: fileConfig.userEmailOverride,
-    userNameOverride: fileConfig.userNameOverride,
-    embeddingModel,
-    embeddingDimensions,
-    embeddingUseTaskPrefixes:
-      fileConfig.embeddingUseTaskPrefixes ?? DEFAULTS.embeddingUseTaskPrefixes,
-    embeddingPooling,
-    embeddingQueryPrefix,
-    embeddingDocumentPrefix,
-    embeddingDtype,
-    embeddingIdleTimeoutMs,
-    embeddingApiUrl: fileConfig.embeddingApiUrl,
-    embeddingApiKey: fileConfig.embeddingApiUrl
-      ? resolveSecretValue(fileConfig.embeddingApiKey ?? process.env.OPENAI_API_KEY)
-      : undefined,
-    similarityThreshold: fileConfig.similarityThreshold ?? DEFAULTS.similarityThreshold,
-    maxMemories: fileConfig.maxMemories ?? DEFAULTS.maxMemories,
-    /**
-     * @deprecated No effect. Use userProfileInjectPreferences, userProfileInjectPatterns,
-     * and userProfileInjectWorkflows to limit injected profile context.
-     */
-    maxProfileItems: fileConfig.maxProfileItems ?? DEFAULTS.maxProfileItems,
-    injectProfile: fileConfig.injectProfile ?? DEFAULTS.injectProfile,
-    containerTagPrefix: fileConfig.containerTagPrefix ?? DEFAULTS.containerTagPrefix,
-    autoCaptureEnabled: fileConfig.autoCaptureEnabled ?? DEFAULTS.autoCaptureEnabled,
-    autoCaptureMaxIterations:
-      fileConfig.autoCaptureMaxIterations ?? DEFAULTS.autoCaptureMaxIterations,
-    autoCaptureIterationTimeout:
-      fileConfig.autoCaptureIterationTimeout ?? DEFAULTS.autoCaptureIterationTimeout,
-    autoCaptureMaxRetries: fileConfig.autoCaptureMaxRetries ?? DEFAULTS.autoCaptureMaxRetries,
-    autoCaptureMaxContextBytes,
-    autoCaptureLanguage: fileConfig.autoCaptureLanguage,
-    autoCaptureProviderOrder: normalizeAutoCaptureProviderOrder(
-      fileConfig.autoCaptureProviderOrder
+  const raw = { ...globalRaw, ...projectRaw };
+  const config: CortexConfig = {
+    storagePath: expandHome(stringField(raw, "storagePath", DEFAULTS.storagePath)),
+    embeddingModel: stringField(raw, "embeddingModel", DEFAULTS.embeddingModel),
+    embeddingDtype: stringField(raw, "embeddingDtype", DEFAULTS.embeddingDtype) as CortexConfig["embeddingDtype"],
+    embeddingDimensions: numberField(
+      raw,
+      "embeddingDimensions",
+      DEFAULTS.embeddingDimensions
     ),
-    updateOnCaptureEnabled: fileConfig.updateOnCaptureEnabled ?? DEFAULTS.updateOnCaptureEnabled,
-    updateOnCaptureSimilarityThreshold: normalizeSimilarityUnitInterval(
-      fileConfig.updateOnCaptureSimilarityThreshold,
-      DEFAULTS.updateOnCaptureSimilarityThreshold
+    databaseEncryptionEnabled: booleanField(
+      raw,
+      "databaseEncryptionEnabled",
+      DEFAULTS.databaseEncryptionEnabled
     ),
-    updateOnCaptureMaxCandidates: normalizeUpdateOnCaptureMaxCandidates(
-      fileConfig.updateOnCaptureMaxCandidates
-    ),
-    memoryProvider,
-    memoryModel,
-    memoryApiUrl,
-    memoryApiKey,
-    memoryTemperature: fileConfig.memoryTemperature,
-    forceToolChoice: fileConfig.forceToolChoice,
-    memoryExtraParams: fileConfig.memoryExtraParams,
-    opencodeProvider: fileConfig.opencodeProvider,
-    opencodeModel: fileConfig.opencodeModel,
-    opencodeVariant: normalizeOpencodeVariant(fileConfig.opencodeVariant),
-    opencodeTimeoutMs: normalizeOpencodeTimeoutMs(fileConfig.opencodeTimeoutMs),
-    autoCaptureProviderStatus: getAutoCaptureProviderStatus({
-      opencodeProvider: fileConfig.opencodeProvider,
-      opencodeModel: fileConfig.opencodeModel,
-      memoryProvider,
-      memoryModel,
-      memoryApiUrl,
-      memoryApiKey,
-    }),
-    aiSessionRetentionDays: fileConfig.aiSessionRetentionDays ?? DEFAULTS.aiSessionRetentionDays,
-    webServerEnabled: fileConfig.webServerEnabled ?? DEFAULTS.webServerEnabled,
-    webServerPort: fileConfig.webServerPort ?? DEFAULTS.webServerPort,
-    webServerHost: fileConfig.webServerHost ?? DEFAULTS.webServerHost,
-    webServerAuthPassword: resolveSecretValue(fileConfig.webServerAuthPassword),
-    webServerAuthUsername: fileConfig.webServerAuthUsername,
-    webServerApiToken: fileConfig.webServerApiToken
-      ? resolveSecretValue(fileConfig.webServerApiToken)
-      : undefined,
-    maxVectorsPerShard: fileConfig.maxVectorsPerShard ?? DEFAULTS.maxVectorsPerShard,
-    autoCleanupEnabled: fileConfig.autoCleanupEnabled ?? DEFAULTS.autoCleanupEnabled,
-    autoCleanupRetentionDays: normalizeAutoCleanupRetentionDays(
-      fileConfig.autoCleanupRetentionDays ?? DEFAULTS.autoCleanupRetentionDays
-    ),
-    deduplicationEnabled: fileConfig.deduplicationEnabled ?? DEFAULTS.deduplicationEnabled,
-    deduplicationSimilarityThreshold:
-      fileConfig.deduplicationSimilarityThreshold ?? DEFAULTS.deduplicationSimilarityThreshold,
-    userProfileAnalysisInterval:
-      fileConfig.userProfileAnalysisInterval ?? DEFAULTS.userProfileAnalysisInterval,
-    userProfileMaxContextBytes:
-      fileConfig.userProfileMaxContextBytes ?? DEFAULTS.userProfileMaxContextBytes,
-    /**
-     * @deprecated No effect on the UI. Use userProfileInjectPreferences for LLM context only.
-     */
-    userProfileDisplayPreferences:
-      fileConfig.userProfileDisplayPreferences ?? DEFAULTS.userProfileDisplayPreferences,
-    /**
-     * @deprecated No effect on the UI. Use userProfileInjectPatterns for LLM context only.
-     */
-    userProfileDisplayPatterns:
-      fileConfig.userProfileDisplayPatterns ?? DEFAULTS.userProfileDisplayPatterns,
-    /**
-     * @deprecated No effect on the UI. Use userProfileInjectWorkflows for LLM context only.
-     */
-    userProfileDisplayWorkflows:
-      fileConfig.userProfileDisplayWorkflows ?? DEFAULTS.userProfileDisplayWorkflows,
-    userProfileInjectPreferences:
-      fileConfig.userProfileInjectPreferences ?? DEFAULTS.userProfileInjectPreferences,
-    userProfileInjectPatterns:
-      fileConfig.userProfileInjectPatterns ?? DEFAULTS.userProfileInjectPatterns,
-    userProfileInjectWorkflows:
-      fileConfig.userProfileInjectWorkflows ?? DEFAULTS.userProfileInjectWorkflows,
-    userProfileConfidenceDecayDays:
-      fileConfig.userProfileConfidenceDecayDays ?? DEFAULTS.userProfileConfidenceDecayDays,
-    userProfileChangelogRetentionCount:
-      fileConfig.userProfileChangelogRetentionCount ?? DEFAULTS.userProfileChangelogRetentionCount,
-    userProfileEmbeddingThresholdSameCat:
-      fileConfig.userProfileEmbeddingThresholdSameCat ??
-      DEFAULTS.userProfileEmbeddingThresholdSameCat,
-    userProfileEmbeddingThresholdSameCatWeak:
-      fileConfig.userProfileEmbeddingThresholdSameCatWeak ??
-      DEFAULTS.userProfileEmbeddingThresholdSameCatWeak,
-    userProfileEmbeddingThresholdCrossCat:
-      fileConfig.userProfileEmbeddingThresholdCrossCat ??
-      DEFAULTS.userProfileEmbeddingThresholdCrossCat,
-    userProfileEmbeddingThresholdCrossCatWeak:
-      fileConfig.userProfileEmbeddingThresholdCrossCatWeak ??
-      DEFAULTS.userProfileEmbeddingThresholdCrossCatWeak,
-    userProfileCentroidDriftThreshold:
-      fileConfig.userProfileCentroidDriftThreshold ?? DEFAULTS.userProfileCentroidDriftThreshold,
-    userProfileEmbeddingMinDescriptionLength:
-      fileConfig.userProfileEmbeddingMinDescriptionLength ??
-      DEFAULTS.userProfileEmbeddingMinDescriptionLength,
-    userProfileMinEvidenceForRetention:
-      fileConfig.userProfileMinEvidenceForRetention ?? DEFAULTS.userProfileMinEvidenceForRetention,
-    userProfileAutoCleanupEnabled:
-      fileConfig.userProfileAutoCleanupEnabled ?? DEFAULTS.userProfileAutoCleanupEnabled,
-    userProfileAutoCleanupInterval,
-    userProfileValidationEnabled:
-      fileConfig.userProfileValidationEnabled ?? DEFAULTS.userProfileValidationEnabled,
-    userProfileStaleDays: fileConfig.userProfileStaleDays ?? DEFAULTS.userProfileStaleDays,
-    showAutoCaptureToasts: fileConfig.showAutoCaptureToasts ?? DEFAULTS.showAutoCaptureToasts,
-    showUserProfileToasts: fileConfig.showUserProfileToasts ?? DEFAULTS.showUserProfileToasts,
-    showErrorToasts: fileConfig.showErrorToasts ?? DEFAULTS.showErrorToasts,
-    databaseEncryptionEnabled:
-      fileConfig.databaseEncryptionEnabled ?? DEFAULTS.databaseEncryptionEnabled,
-    // Keep raw ref (env:// / file:// / hex); resolved lazily with optional auto-create.
-    databaseEncryptionKey: fileConfig.databaseEncryptionKey,
-    databaseEncryptionCipher:
-      fileConfig.databaseEncryptionCipher ?? DEFAULTS.databaseEncryptionCipher,
-    autoUpdate: fileConfig.autoUpdate ?? DEFAULTS.autoUpdate,
-    tursoAutoHeal: fileConfig.tursoAutoHeal ?? DEFAULTS.tursoAutoHeal,
-    tursoMultiprocessWal: fileConfig.tursoMultiprocessWal ?? DEFAULTS.tursoMultiprocessWal,
-    memory: {
-      defaultScope: fileConfig.memory?.defaultScope ?? DEFAULTS.memory.defaultScope,
-    },
-    compaction: {
-      enabled: fileConfig.compaction?.enabled ?? DEFAULTS.compaction.enabled,
-      memoryLimit: fileConfig.compaction?.memoryLimit ?? DEFAULTS.compaction.memoryLimit,
-    },
-    chatMessage: {
-      enabled: fileConfig.chatMessage?.enabled ?? DEFAULTS.chatMessage.enabled,
-      maxMemories: fileConfig.chatMessage?.maxMemories ?? DEFAULTS.chatMessage.maxMemories,
-      excludeCurrentSession:
-        fileConfig.chatMessage?.excludeCurrentSession ?? DEFAULTS.chatMessage.excludeCurrentSession,
-      maxAgeDays: fileConfig.chatMessage?.maxAgeDays,
-      injectOn: (fileConfig.chatMessage?.injectOn ?? DEFAULTS.chatMessage.injectOn) as
-        "first" | "always",
-      recall: normalizeChatMessageRecall(fileConfig.chatMessage?.recall),
-      recallScope: normalizeChatMessageRecallScope(fileConfig.chatMessage?.recallScope),
-      similarityThreshold:
-        typeof fileConfig.chatMessage?.similarityThreshold === "number" &&
-        Number.isFinite(fileConfig.chatMessage.similarityThreshold)
-          ? fileConfig.chatMessage.similarityThreshold
-          : DEFAULTS.chatMessage.similarityThreshold,
-      filterInjectedPrompts:
-        fileConfig.chatMessage?.filterInjectedPrompts ?? DEFAULTS.chatMessage.filterInjectedPrompts,
-      injectionMarkers: normalizeInjectionMarkers(fileConfig.chatMessage?.injectionMarkers),
-      captureChildSessions:
-        fileConfig.chatMessage?.captureChildSessions ?? DEFAULTS.chatMessage.captureChildSessions,
-    },
-    dreaming: {
-      enabled: fileConfig.dreaming?.enabled ?? DEFAULTS.dreaming.enabled,
-      intervalHours: normalizeDreamingIntervalHours(fileConfig.dreaming?.intervalHours),
-      maxGroupsPerRun: normalizeDreamingMaxGroupsPerRun(fileConfig.dreaming?.maxGroupsPerRun),
-      trashRetentionDays: normalizeDreamingTrashRetentionDays(
-        fileConfig.dreaming?.trashRetentionDays
-      ),
-      relatedThreshold: normalizeDreamingRelatedThreshold(fileConfig.dreaming?.relatedThreshold),
-      crossProject: fileConfig.dreaming?.crossProject ?? DEFAULTS.dreaming.crossProject,
-    },
+    databaseEncryptionCipher: stringField(
+      raw,
+      "databaseEncryptionCipher",
+      DEFAULTS.databaseEncryptionCipher
+    ) as CortexConfig["databaseEncryptionCipher"],
+    dedupRejectThreshold: thresholdField(raw, "dedupRejectThreshold", DEFAULTS.dedupRejectThreshold),
+    dedupHintThreshold: thresholdField(raw, "dedupHintThreshold", DEFAULTS.dedupHintThreshold),
+    blockedPatterns: Array.isArray(raw.blockedPatterns)
+      ? raw.blockedPatterns.map((value, index) => {
+          if (typeof value !== "string" || !value) {
+            throw new Error(`配置项 blockedPatterns[${index}] 必须是非空字符串`);
+          }
+          return value;
+        })
+      : [],
+    ...(typeof raw.opencodeProvider === "string" && raw.opencodeProvider.trim()
+      ? { opencodeProvider: raw.opencodeProvider.trim() }
+      : {}),
+    ...(typeof raw.opencodeModel === "string" && raw.opencodeModel.trim()
+      ? { opencodeModel: raw.opencodeModel.trim() }
+      : {}),
+    ...(typeof raw.databaseEncryptionKey === "string" && raw.databaseEncryptionKey.trim()
+      ? { databaseEncryptionKey: raw.databaseEncryptionKey.trim() }
+      : {}),
   };
-}
 
-const _globalFileConfig = loadConfigFromPaths(CONFIG_FILES);
-export let CONFIG = buildConfig(_globalFileConfig);
-
-type RuntimeConfig = ReturnType<typeof buildConfig>;
-
-interface AutoCaptureProviderRuntimeConfig {
-  opencodeProvider?: string;
-  opencodeModel?: string;
-  memoryProvider?: string;
-  memoryModel?: string;
-  memoryApiUrl?: string;
-  memoryApiKey?: string;
-}
-
-export type AutoCaptureProviderStatus =
-  { ready: true; mode: "opencode" | "manual"; issues: [] } | { ready: false; issues: string[] };
-
-function hasValue(value: string | undefined): boolean {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-export { isPlaceholderApiKey };
-
-export function getAutoCaptureProviderStatus(
-  config: AutoCaptureProviderRuntimeConfig
-): AutoCaptureProviderStatus {
-  const hasOpencodeProvider = hasValue(config.opencodeProvider);
-  const hasOpencodeModel = hasValue(config.opencodeModel);
-  if (hasOpencodeProvider && hasOpencodeModel) {
-    return { ready: true, mode: "opencode", issues: [] };
+  if (!DTYPES.has(config.embeddingDtype)) {
+    throw new Error(
+      `配置项 embeddingDtype 非法：${config.embeddingDtype}。可选 ${[...DTYPES].join(", ")}`
+    );
   }
-
-  const issues: string[] = [];
-  if (!hasOpencodeProvider) issues.push("opencodeProvider is not configured");
-  if (!hasOpencodeModel) issues.push("opencodeModel is not configured");
-
-  const hasMemoryModel = hasValue(config.memoryModel);
-  const hasMemoryApiUrl = hasValue(config.memoryApiUrl);
-  const hasMemoryApiKey = hasValue(config.memoryApiKey);
-  const hasPlaceholderMemoryApiKey = isPlaceholderApiKey(config.memoryApiKey);
-
-  // Preset providers fill endpoint/model themselves (and buildConfig resolves
-  // those defaults into CONFIG), so only an API key is required for the manual
-  // fallback path.
-  if (isMemoryProviderPreset(config.memoryProvider)) {
-    if (!hasMemoryApiKey) issues.push("memoryApiKey is not configured");
-    if (hasPlaceholderMemoryApiKey) issues.push("memoryApiKey contains a placeholder value");
-    if (hasMemoryApiKey && !hasPlaceholderMemoryApiKey) {
-      return { ready: true, mode: "manual", issues: [] };
-    }
-    return { ready: false, issues };
+  if (!CIPHERS.has(config.databaseEncryptionCipher)) {
+    throw new Error(`配置项 databaseEncryptionCipher 非法：${config.databaseEncryptionCipher}`);
   }
-
-  if (!hasMemoryModel) issues.push("memoryModel is not configured");
-  if (!hasMemoryApiUrl) issues.push("memoryApiUrl is not configured");
-  if (!hasMemoryApiKey) issues.push("memoryApiKey is not configured");
-  if (hasPlaceholderMemoryApiKey) issues.push("memoryApiKey contains a placeholder value");
-
-  if (hasMemoryModel && hasMemoryApiUrl && hasMemoryApiKey && !hasPlaceholderMemoryApiKey) {
-    return { ready: true, mode: "manual", issues: [] };
+  if (!Number.isInteger(config.embeddingDimensions) || config.embeddingDimensions <= 0) {
+    throw new Error("配置项 embeddingDimensions 必须是正整数");
   }
-
-  return { ready: false, issues };
-}
-
-export function hasAutoCaptureProviderConfig(config: RuntimeConfig = CONFIG): boolean {
-  return getAutoCaptureProviderStatus(config).ready;
-}
-
-export function initConfig(directory: string): void {
-  const projectPaths = [
-    join(directory, ".opencode", "opencode-mem.jsonc"),
-    join(directory, ".opencode", "opencode-mem.json"),
-  ];
-  const globalConfig = loadConfigFromPaths(CONFIG_FILES);
-  const projectConfig = loadConfigFromPaths(projectPaths);
-  assertProjectRemoteProviderConfigIsSafe(projectConfig);
-  const projectOverrides = { ...projectConfig };
-  delete projectOverrides.autoCleanupEnabled;
-  delete projectOverrides.autoCleanupRetentionDays;
-  const merged: OpenCodeMemConfig = { ...globalConfig, ...projectOverrides };
-  CONFIG = buildConfig(merged);
-}
-
-export function isConfigured(): boolean {
-  return true;
+  if (config.dedupHintThreshold >= config.dedupRejectThreshold) {
+    throw new Error("dedupHintThreshold 必须小于 dedupRejectThreshold");
+  }
+  return config;
 }

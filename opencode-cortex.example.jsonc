@@ -1,0 +1,27 @@
+{
+  // opencode-cortex 全局配置示例
+  // 放到 ~/.config/opencode/opencode-cortex.jsonc
+  // 项目级配置放到 <项目>/.opencode/opencode-cortex.jsonc
+
+  "storagePath": "~/.opencode-cortex",
+
+  // 本地 transformers.js ONNX 模型，768 维，CLS pooling + 归一化
+  "embeddingModel": "Xenova/bge-base-zh-v1.5",
+  "embeddingDtype": "q8",
+  "embeddingDimensions": 768,
+
+  // 相似度 >= 0.92 拒绝新增并返回已有 id；0.85~0.92 允许写入但提示相似
+  "dedupRejectThreshold": 0.92,
+  "dedupHintThreshold": 0.85,
+
+  // 额外敏感信息正则，命中 title/content/related_files/source_ref 即拒绝写入
+  "blockedPatterns": [],
+
+  // 可选数据库加密；启用后未配置 key 时自动生成到 <storagePath>/db.key
+  "databaseEncryptionEnabled": false,
+  // "databaseEncryptionKey": "64 位十六进制字符，只能放全局配置",
+
+  // 后续自动提取使用；opencodeModel 可为 "inherit"
+  // "opencodeProvider": "anthropic",
+  // "opencodeModel": "claude-haiku-4-5-20251001"
+}

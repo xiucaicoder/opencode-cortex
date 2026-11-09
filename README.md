@@ -1,815 +1,118 @@
-# OpenCode Memory
+# opencode-cortex
 
-[![npm version](https://img.shields.io/npm/v/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
-[![npm downloads](https://img.shields.io/npm/dm/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
-[![license](https://img.shields.io/npm/l/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
-[![GitHub stars](https://img.shields.io/github/stars/tickernelz/opencode-mem.svg)](https://github.com/tickernelz/opencode-mem)
-[![Website](https://img.shields.io/badge/website-opencode--mem.zhafron.my.id-blue)](https://opencode-mem.zhafron.my.id)
-[![Docs](https://img.shields.io/badge/docs-opencode--mem.zhafron.my.id%2Fdocs-blue)](https://opencode-mem.zhafron.my.id/docs/)
+项目级「业务知识与架构记忆」插件。只沉淀四类内容，让新接手的开发者或新会话中的 AI 不翻历史对话就能知道项目为什么这样做。
 
-![OpenCode Memory Banner](.github/pics/banner.png)
+- `domain_rule`：业务规则
+- `arch_decision`：架构决策及原因
+- `data_constraint`：数据与状态约束
+- `pitfall`：踩坑及根因
 
-Languages: **🇬🇧** | [🇩🇪](./.github/i18n/README.de.md) | [🇨🇳](./.github/i18n/README.zh.md) | [🇸🇦](./.github/i18n/README.ar.md) | [🇹🇷](./.github/i18n/README.tr.md) | [🇳🇱](./.github/i18n/README.nl.md)
+## 设计边界
 
-A persistent memory system for AI coding agents that enables long-term context retention across sessions using local vector database technology.
+- 每个项目一个 Turso/libSQL 数据库，按项目身份自动分库。
+- 默认 embedding：`Xenova/bge-base-zh-v1.5`（本地 transformers.js，768 维，CLS pooling，归一化）。
+- 不记录用户画像、对话时间线、调试过程、通用技术知识、临时状态和任何密钥。
+- 删除只做归档（`status=archived`），不物理删除。
+- 新项目只支持全新 schema v1，不兼容旧版 opencode-mem 数据。
 
-## Core Features
+## 工具
 
-- **Local database:** embedded Turso/libSQL with native vector search, stored under `storagePath`. No separate vector database.
-- **Intelligent prompt-based memory extraction (auto-capture):** when a session goes idle, a background AI request turns the technical work into persistent project memories.
-- **Automatic recall:** relevant memories and the user profile are injected into the model's context (`chatMessage`).
-- **User profile learning:** a cross-project summary of your preferences, patterns and workflows.
-- **Memory hygiene:** smart deduplication, optional update-on-capture, and optional dreaming consolidation with recoverable trash.
-- **Multi-provider AI support:** any provider configured in OpenCode (`opencodeProvider` / `opencodeModel`), or a manual API: OpenAI Chat Completions, OpenAI Responses, Anthropic, MiniMax, OrcaRouter, Atlas Cloud, Cheaper Inference, API Route, Runcrate, CloudGPU.
-- **Embeddings:** 12+ local embedding models on CPU (no GPU needed) or any OpenAI-compatible embeddings API.
-- **Full-featured web UI:** unified memory–prompt timeline, user profile, skill library, Markdown vault and health stats, with optional HTTP Basic Auth.
-- **Privacy:** `<private>` tags, credential redaction before capture, and optional encryption at rest.
-- **Portability:** optional Markdown vault backend, and `memory` tool `export` / `import` / `migrate` for moved or copied projects.
+只暴露两个工具：
 
-## Memory credential redaction
+### `memory_search(query, limit = 5)`
 
-Before auto-capture sends context to its configured summarization provider (including fallback),
-the plugin removes recognizable credentials from user text, assistant text, tool inputs,
-preserved tool-result evidence and prior-memory context. Pending prompts/evidence are sanitized
-before persistence; generated summaries and tags are sanitized again before embedding and new
-memory writes. The explicit memory `add` tool uses the same write boundary. This applies to
-both Turso and plugin-created Markdown memories, without an extra model call or dependency.
+仅检索 `active` 条目，返回：
 
-Recognized formats include supported GitHub tokens, OpenAI/Anthropic/OpenRouter/Google API key
-shapes, Slack tokens, AWS access key IDs, bearer credentials and PEM private keys, plus
-conservative credential assignments. Replacements retain useful surrounding context. Existing
-`<private>...</private>` protection remains: nested or unclosed regions fail closed. An unclosed
-PEM private-key opener similarly redacts to the end of that text. Sanitization precedes capture
-length limits so a cutoff does not leave part of a recognized credential behind. Plugin diagnostic
-strings use the same sanitizer; matches are never reported separately.
-
-**Limits:** this is best-effort protection for the plugin's memory copies, not OpenCode's original
-conversation, main-model requests or tool traffic. Arbitrary passwords, all-letter bearer values,
-custom/encoded tokens,
-obfuscated values and credentials split across separate messages may not be recognized. Use
-`<private>` for other sensitive text. Hashes, UUIDs and arbitrary long strings are not treated as
-secrets. Existing stored memories are not scanned or rewritten. Web/API additions, imports,
-user-edited Markdown reconciliation, migrations and profile/dreaming generation have separate
-paths and are not covered by this capture/add guarantee. Content and tag edits through the
-shared memory client are sanitized when supplied, but untouched historical fields are preserved
-(and can still be re-embedded by existing edit behavior).
-New capture/add content is already redacted when later searched, displayed or injected; this is
-not a read-time scrub of historical data. Keep credentials out of memory input where possible,
-and rotate any credential already disclosed.
-
-## Prerequisites
-
-This plugin uses embedded Turso (`@tursodatabase/database`) with `F32_BLOB` vectors and exact cosine search via `vector_distance_cos`. No separate vector database or custom SQLite build is required.
-
-**Recommended runtime:**
-
-- Bun
-- Standard OpenCode plugin environment
-- Internet access on first use if you use the default local embedding model, because the model is downloaded by `@huggingface/transformers`.
-- For source/development installs, run `bun install` before building or testing. The published plugin package installs its runtime dependencies automatically through OpenCode.
-
-**CI-tested platforms:** Linux, Windows, and macOS 15 / macOS 26 on Apple Silicon (`darwin/arm64`). **Intel Mac (`darwin/x64`) is not supported** — `@tursodatabase/database` and fixed `onnxruntime-node` releases ship no x64 native binding. Older macOS releases are not excluded by that matrix; they are simply outside the current GitHub-hosted runner set.
-
-**Notes:**
-
-- Vector embeddings are stored and searched directly in Turso; inserts store `F32_BLOB` vectors for exact cosine ranking.
-- Vector search uses exact cosine distance via `vector_distance_cos` (no DiskANN / approximate index), with optional keyword hybrid ranking when a query string is provided (`@tursodatabase/database` does not ship FTS5).
-- Session lookups use an indexed `session_id` column (backfilled from `metadata.sessionID` on schema v2).
-- Auto-capture and user profile learning require an AI provider that can return structured/tool-call output. Memory search/add/list still work without auto-capture provider configuration.
-
-### Hardware / resource expectations
-
-opencode-mem does **not** require a GPU. Local embeddings run on CPU via `@huggingface/transformers` and ONNX (there is no MLX backend). Extra VRAM is not needed.
-
-| Workload                                                      | Typical extra resources                                                                                                                                                                                                                                                 |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Local embeddings** (default `Xenova/nomic-embed-text-v1`)   | About **0.5–2 GB RAM** while the model is loaded, depending on the Hugging Face id you pick. First use downloads the model; disk cache lives under `{storagePath}/.cache` (default `~/.opencode-mem/data/.cache`) and is often **hundreds of MB to ~1–2 GB** per model. |
-| **Remote embeddings** (`embeddingApiUrl` + `embeddingApiKey`) | Negligible local ML RAM — only plugin + Turso overhead.                                                                                                                                                                                                                 |
-| **Database / plugin**                                         | Turso/libSQL on disk under `storagePath`. Size grows with how many memories you store, not with GPU memory.                                                                                                                                                             |
-
-Platform limits above still apply (no Intel Mac `darwin/x64`; use Apple Silicon, Linux, Windows, or a remote embedding endpoint). See [Choosing / configuring embeddings](#choosing--configuring-embeddings).
-
-### Upgrading from legacy SQLite shards
-
-Startup recovers interrupted re-embed swaps, converts libSQL DiskANN indexes to the current Turso engine, and then verifies or upgrades the legacy shard schema. Engine conversion runs even when a store already has a completed legacy migration marker, and preserves stored vectors without re-embedding. Each converted database is backed up as `<database>.pre-tursodb-<timestamp>.bak`.
-
-On macOS and Linux, multiple OpenCode sessions can share the same `storagePath` via Turso’s experimental `multiprocess_wal` (every process must use the same mode — restart all sessions after upgrading). On Windows the engine rejects that flag, so only one OpenCode session can own the memory databases at a time.
-
-`tursoMultiprocessWal: false` opens in single-owner mode instead: other processes then fail with `database is locked` rather than sharing the store. That is the safer choice if non-plugin tools touch the same files, because a _writing_ foreign SQLite process makes Turso’s WAL index stale and its own next write is silently lost. `tursoAutoHeal` (default `true`) moves a store’s `-shm`/`-tshm` index sidecars into `storagePath/recovery/<db>-<timestamp>/` and retries once when an open fails with a stale WAL index, after verifying a copy of the main database. A non-empty `-wal` is never moved, so committed but uncheckpointed transactions survive; only an absent or 0-byte `-wal` is removed. Concurrent sessions serialise healing through `storagePath/recovery/<db>.lock`.
-
-On first startup after upgrading, opencode-mem automatically migrates existing memory shard databases to native Turso/libSQL vector format:
-
-- Each shard is backed up as `<shard>.db.legacy.bak` before rewrite
-- Progress is tracked per shard in `<shard>.db.turso-migrate.json`
-- A global marker `.turso-migrated` is written only after all shards verify successfully
-- Normal inserts and deletes do not invalidate a completed shard migration; startup still checks that its vectors are readable and match its stored dimensions
-- Do not run multiple OpenCode instances against the same `storagePath` during migration; a lock file (`.turso-migrate.lock`) prevents concurrent migration
-- Manual dimension migrations use `.turso-operation.lock`; other plugin processes reject new memory writes until the migration finishes
-- Locks expire after 30 minutes without a progress timestamp update (or file modification time if the timestamp is unavailable), even if the owning process is alive. This lease uses wall-clock time: a forward clock step greater than 30 minutes can expire a progressing operation early; a backward step or future-dated lock can extend an inert lock's life. Locks carry a unique acquisition id, and stale cleanup only removes the exact file it inspected. Migrations heartbeat as they progress and abort if they discover that ownership was lost. Stale-lock cleanup is logged for diagnosis
-
-If migration is interrupted, the next startup resumes from the backup automatically.
-
-If a shard becomes incompatible (for example after changing `embeddingDimensions`), writes are blocked and the original database is left untouched. Use the Web UI's re-embed migration to build and verify a replacement before it is swapped into place. The previous shard remains available as `<shard>.db.pre-reembed-<pid>-<timestamp>.bak`.
-
-## Schema migrations
-
-Local Turso shards and auxiliary databases (`metadata.db`, `user-prompts.db`, `user-profiles.db`, `ai-sessions.db`) are upgraded with ordered `PRAGMA user_version` migrations in `src/services/turso/schema-migrations.ts`. Migrations are idempotent: starting the plugin applies only pending versions.
-
-## Getting Started
-
-For OpenCode v2, add the package to the native `plugins` list:
-
-```jsonc
-{
-  "plugins": ["opencode-mem@latest"],
-}
+```json
+[
+  {
+    "id": "…",
+    "title": "…",
+    "category": "domain_rule",
+    "content": "…",
+    "related_files": [],
+    "updated_at": 1760000000000,
+    "version": 1
+  }
+]
 ```
 
-OpenCode also loads the package's `./tui` companion automatically so
-auto-capture / profile / error toasts render in the TUI (server plugins
-cannot call `ui.toast` directly). You do not need a second entry in
-`plugins`. If you run a CLI-only TUI against a remote OpenCode server,
-register `opencode-mem/tui` in that CLI's plugin list (for example
-`cli.json`) so the companion can subscribe to toast RPC events.
+### `memory_mutate(action, id?, version?, title, category, content, related_files?, source_ref?)`
 
-For OpenCode v1, add the default entrypoint to your configuration at
-`~/.config/opencode/opencode.json`:
+- `content` 最多 200 字。
+- `update` / `delete` 必须带 `id` 和 `version`；版本冲突会被拒绝并要求重新检索。
+- `add` 前做相似检索：
+  - 相似度 ≥ `dedupRejectThreshold`（默认 0.92）：拒绝，返回已有条目 id，提示改用 `update`。
+  - 相似度在 `dedupHintThreshold`（默认 0.85）与拒绝阈值之间：允许写入，同时返回相似提示。
+- 标题、正文、`related_files`、`source_ref` 命中内置或自定义敏感信息规则时拒绝写入。
+- 带 `source_ref` 记为 `import`，否则记为 `manual`；自动提取记为 `auto`。
+- `delete` 只归档。
 
-```jsonc
-{
-  "plugin": ["opencode-mem@latest"],
-}
+工具错误统一返回：
+
+```json
+{ "success": false, "code": "duplicate", "error": "…", "id": "…", "similarity": 0.93 }
 ```
 
-With `@latest` (or a semver range) and `autoUpdate: true` in `opencode-mem.jsonc` (default), the plugin clears OpenCode's cached install when a newer npm release is available and asks you to restart. Pinned versions like `opencode-mem@2.26.0` are never auto-updated.
+## 配置
 
-### Automatic memory context on OpenCode v2
+全局配置：`~/.config/opencode/opencode-cortex.jsonc`  
+项目配置：`<项目>/.opencode/opencode-cortex.jsonc`（覆盖全局；不允许设置加密密钥）
 
-The v2 plugin supplies automatic memory context through the model's system context.
-These blocks are not added to the authored user prompt or stored in the chat transcript.
-With `chatMessage.injectOn: "first"` (the default), the session's initial context is
-retained across user turns and model steps. With `"always"`, it is refreshed on each
-authored user turn.
+参考 [`opencode-cortex.example.jsonc`](./opencode-cortex.example.jsonc)。
 
-After a host or plugin restart, a resumed session rebuilds its context from the
-current memory store on its next model request, even if no new user prompt arrives.
-The rebuilt context may differ from the original as memories and the profile evolve.
-Restoration does not capture a synthetic user prompt or store a second copy of the
-memory text in OpenCode plugin storage. Compaction invalidates the cached automatic
-context; the existing compaction-memory restoration also continues to run.
+主要配置项：
 
-### Using a local checkout
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `storagePath` | `~/.opencode-cortex` | 数据库、日志、模型缓存目录 |
+| `embeddingModel` | `Xenova/bge-base-zh-v1.5` | 本地 ONNX 模型 |
+| `embeddingDtype` | `q8` | ONNX 权重精度 |
+| `embeddingDimensions` | `768` | 必须与模型一致 |
+| `dedupRejectThreshold` | `0.92` | 达到即拒绝新增 |
+| `dedupHintThreshold` | `0.85` | 达到即提示相似 |
+| `blockedPatterns` | `[]` | 额外敏感信息正则 |
+| `databaseEncryptionEnabled` | `false` | 可选 Turso 加密 |
+| `databaseEncryptionKey` | 自动生成 | 64 位十六进制 AES-256 密钥，仅限全局配置 |
+| `opencodeProvider` / `opencodeModel` | 未设置 | 后续自动提取使用的 provider/model，`inherit` 跟随宿主 |
 
-To run the plugin from a local source checkout instead of the npm release, `bun install && bun run build` in the checkout, then point the `plugins` list at the checkout directory:
+项目身份规则：从工作目录向上查找 `.opencode-cortex-project`；找到则整个子树共用该根目录的库。否则使用 git common dir，再否则使用目录路径。
 
-```jsonc
-{
-  "plugins": ["/absolute/path/to/opencode-mem"],
-}
+数据库记录 embedding 模型与维度。模型或维度不一致时拒绝读写，并给出明确错误；不做自动重嵌入或迁移。
+
+## 导入与导出
+
+导入和导出不占用 tool，避免 AI 误用：
+
+```bash
+# JSONL 导入（支持 {"type":"overview","content":"…"} 设置项目概览）
+bun run scripts/import.ts memories.jsonl
+
+# Markdown 导出，供人工审阅并提交进 git
+bun run scripts/export.ts memories.md
+bun run scripts/export.ts memories.md --all   # 包含已归档条目
 ```
 
-Point at the package root, not at `dist/` or a single file. OpenCode resolves a directory plugin by falling back to `<directory>/index` (OpenCode does not read `package.json` `exports`/`main` for a path spec on current releases), so this repository ships a thin root `index.js` that re-exports the built v2 entrypoint from `dist/plugin.js`, and a root `tui.js` that re-exports `dist/tui.js` for the TUI companion. A path to a file is rejected (`configured plugin path must be a directory`), and a directory without a root `index.js` is skipped silently.
+导入沿用同一套长度、分类、密钥拦截和去重校验；相同内容重复导入会跳过。
 
-### Optional database encryption at rest
-
-Enable AES-256-GCM encryption for local Turso shards in `~/.config/opencode/opencode-mem.jsonc`:
-
-```jsonc
-{
-  "databaseEncryptionEnabled": true,
-}
-```
-
-On first start the plugin creates `~/.config/opencode/opencode-mem-db.key` (32-byte hex key, `chmod 600`) and migrates existing plaintext shards. Override with `"databaseEncryptionKey": "env://OPENCODE_MEM_DB_KEY"` or `"file://~/path/to.key"` if you manage the key yourself. Losing the key means the encrypted databases cannot be opened. `databaseEncryptionCipher` selects the cipher: `aes256gcm` (default), `aes128gcm`, `aegis256`, `aegis256x2`, `aegis128l`, `aegis128x2` or `aegis128x4`.
-
-**Windows:** use `%USERPROFILE%\.config\opencode\opencode.json` (for example `C:\Users\<you>\.config\opencode\opencode.json`). This plugin does **not** read `%APPDATA%` or `%LOCALAPPDATA%` for its OpenCode plugin entry — put the file under `.config\opencode` in your user profile, then restart OpenCode. If the plugin does not appear, confirm that path and restart again.
-
-The plugin downloads automatically on next startup.
-
-## How to use day-to-day
-
-You do **not** need to ask OpenCode to “remember” things for the plugin to work. With the defaults, memory builds up as you work.
-
-### Typical daily flow
-
-1. Enable the plugin (see [Getting Started](#getting-started)) and restart OpenCode.
-2. Configure an AI provider for auto-capture — recommended: `opencodeProvider` + `opencodeModel` (or `"opencodeModel": "inherit"`). Details under [Auto-Capture AI Provider](#auto-capture-ai-provider).
-3. Work normally in OpenCode. When a session goes idle, auto-capture extracts memorable technical context and stores it.
-4. In later sessions, relevant memories are injected into context (see `chatMessage` / compaction settings). Browse or edit them in the web UI at `http://127.0.0.1:4747`.
-5. Use the `memory` tool when you want something stored or retrieved immediately (see [Usage Examples](#usage-examples)).
-
-### Automatic vs manual memory
-
-| Approach                                               | When it runs                                        | What you do                                                                                        |
-| ------------------------------------------------------ | --------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| **Auto-capture** (`autoCaptureEnabled: true`, default) | After conversation turns when the session goes idle | Nothing — extraction is automatic                                                                  |
-| **Manual** `memory` tool / commands                    | On demand                                           | `add`, `search`, `list`, `profile`, `forget`, `list-shards`, `migrate`, `export`, `import`, `help` |
-
-Manual search/add/list still work even if auto-capture has no provider configured. Auto-capture and user profile learning need a provider that can return structured/tool-call output.
-
-### Memory vs AGENTS.md vs Skills
-
-| Store in **memory**                                                  | Store in **AGENTS.md** / static docs                        | Store as **Skills** (web UI / `skills.db`)            |
-| -------------------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------------- |
-| Project-specific decisions, bug patterns, “we tried X and it failed” | Stable rules and workflows that rarely change               | Reusable procedures the agent loads on demand         |
-| User preferences discovered over sessions                            | Always-on coding conventions and process                    | Team-editable skill packs shared via the same storage |
-| Facts that should follow you across chats                            | Instructions every agent should see regardless of retrieval | OpenCode-native `skill` tool (V2 plugin bridge)       |
-
-Rule of thumb: lasting always-on project instructions → `AGENTS.md`; growing work context → memory; reusable on-demand procedures → **Skills**.
-
-#### Shared Skills (V2)
-
-- Create/edit skills in the web explorer (**Skills** tab at `/skill-library`).
-- Persisted in `skills.db` under the plugin storage path (not as memory vectors).
-- On OpenCode **V2**, the plugin registers enabled skills via `ctx.skill.transform` so the agent can load them with the native `skill` tool.
-- Optional HTTP catalog for other OpenCode instances: `"skills": ["http://127.0.0.1:4747/skills/"]` (serves `/skills/index.json` and `/skills/<id>/<id>.md` — separate from the UI path).
-- REST: `GET/POST /api/skills`, `GET/PUT/DELETE /api/skills/:id`.
-
-### Health stats
-
-The web UI's **Stats** tab (at `/stats`) shows memory-system health at a glance: totals per scope, per-shard memory counts with stale/missing-shard warnings and a same-tag duplication proxy, the active user-profile version, and a 14-day activity series (captures, skipped captures, profile/compaction injections, and errors bucketed by message) parsed from the plugin's own structured logs in `~/.opencode-mem/`. It is read-only — `GET /api/stats` — and degrades per section if a database is unavailable, so it keeps reporting during incidents.
-
-### Intelligent prompt-based memory extraction
-
-That phrase in the feature list is **auto-capture**: after a conversation, a background AI request summarizes technical work and saves it as memory. No special prompt from you is required. It uses `opencodeProvider` / `opencodeModel` when set, otherwise the manual `memoryProvider` fallback.
-
-Auto-capture uses bounded textual tool outcomes alongside assistant text. Invocation status is
-not proof that a command, test, or task succeeded: summaries must distinguish plans, attempts,
-failures, observed results and unverified claims. Useful failure/recovery lessons can be
-remembered; routine command failures need not produce memories.
-
-Tool results are privacy-filtered before truncation, limited to 2 KiB per result and 16 KiB
-for the whole tool-evidence block (or less under a small context budget). Up to 32 calls are
-retained, preserving early and recent attempts and explicitly marking omissions. File
-attachments, arbitrary metadata and full logs are not imported. This adds no new evidence
-store; existing deleted-session recovery bounds/expiry remain unchanged. These excerpts
-are partial evidence, not a verifier, and model summaries can still be wrong.
-
-Generated capture summaries are limited to 8 KiB UTF-8, with at most eight 64-byte tags.
-Oversized responses use the existing fallback/retry path rather than silently chopping away
-an outcome caveat; oversized update-on-capture rewrites fall back to adding the bounded draft.
-These limits apply before memory embedding/storage, not to all provider response traffic.
-External providers retain requests and raw responses in their existing session history
-(seven-day default expiry), before capture validation. Tool evidence in requests is bounded,
-but this does not bound raw provider responses; retries retain separate copies and cleanup
-must run.
-This is not a global database-size cap, and deleting rows need not immediately shrink DB/WAL
-files. No historical memories or provider-history settings are changed.
-
-### User profile
-
-The **User Profile** is a separate, cross-project summary of how you like to work (preferences, habits). It is updated on an interval (`userProfileAnalysisInterval`, default every 10 analyzed prompts), shown in the web UI’s profile view, and readable via `memory({ mode: "profile" })`. You do not populate it by hand for normal use — profile learning fills it when a provider is ready. Output language follows `autoCaptureLanguage` (default `"auto"`, mirroring the language of your prompts), the same setting used for auto-captured memories.
-
-**“No profile found. Keep chatting to build your profile.”** is the expected empty state, not a crash. Profile learning needs:
-
-1. Auto-capture running with a reachable provider (`opencodeProvider` + `opencodeModel`, or a complete manual fallback with `memoryModel` + `memoryApiUrl`).
-2. Enough session prompts since the last analysis — at least `userProfileAnalysisInterval` (default **10**).
-3. That provider to support structured/tool-call output (same requirement as auto-capture).
-
-If you have chatted for a while and still see the message, check that auto-capture is actually firing in the logs and that the configured provider succeeds (failed profile analysis no longer hides behind a generic empty state when the provider errors).
-
-### Web UI
-
-Open `http://127.0.0.1:4747` to browse the memory–prompt timeline, inspect captures, and manage the user profile. The UI has five views: **Project memories** (`/project-memories`), **User profile** (`/user-profile`), **Skill library** (`/skill-library`), **Markdown vault** (`/markdown-vault`) and **Stats** (`/stats`). Change the port with `webServerPort`, or set `webServerEnabled: false` to run without the web UI. If you bind the server beyond loopback, see [Web UI HTTP Basic Auth](#web-ui-http-basic-auth).
-
-The timeline shows each memory and prompt once. If several capture prompts refer to one memory, its current prompt is paired with it when available on the page; earlier prompts remain visible as separate entries.
-
-## Usage Examples
-
-```typescript
-memory({ mode: "add", content: "Project uses microservices architecture" });
-memory({ mode: "search", query: "architecture decisions" });
-memory({ mode: "search", query: "architecture decisions", scope: "all-projects" });
-memory({ mode: "profile" });
-memory({ mode: "list", limit: 10 });
-memory({ mode: "list-shards" });
-memory({ mode: "migrate", fromPath: "/old/path/to/project" });
-memory({ mode: "export", outputPath: "./memories.json" });
-memory({ mode: "import", inputPath: "./memories.json" });
-```
-
-Access the web interface at `http://127.0.0.1:4747` for visual memory browsing and management.
-
-**Network binding security:** Keep `webServerHost` on `127.0.0.1` unless you intentionally expose the UI. Binding to `0.0.0.0` (or any non-loopback host) requires `webServerApiToken`; all `/api/*` requests must then send `Authorization: Bearer <token>` or `X-Opencode-Mem-Token`. Open the UI with `?apiToken=<token>` so the browser stores and sends it.
-
-Dimension migrations generate every new embedding first, import them into a temporary indexed shard, verify the row count, and only then replace the original file. Failed migrations leave the source shard untouched.
-
-## Configuration Essentials
-
-Configure at `~/.config/opencode/opencode-mem.jsonc`:
-
-**Windows:** `%USERPROFILE%\.config\opencode\opencode-mem.jsonc` (same `.config\opencode` directory as above — not AppData). Default storage resolves to `%USERPROFILE%\.opencode-mem\data` (the `~` form expands to your user home on Windows as well).
-
-The plugin creates a full commented template at this path on first startup. For every setting and comment, see [`opencode-mem.example.jsonc`](opencode-mem.example.jsonc).
-
-Commonly tuned top-level options:
-
-| Option                                                                | Default                         | What it does                                                                                                                    |
-| --------------------------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `storagePath`                                                         | `"~/.opencode-mem/data"`        | Where the memory databases live.                                                                                                |
-| `webServerEnabled` / `webServerPort` / `webServerHost`                | `true` / `4747` / `"127.0.0.1"` | Web UI server switch, port and bind address.                                                                                    |
-| `autoCaptureEnabled`                                                  | `true`                          | Summarize idle sessions into memories (needs a provider, see [Auto-Capture AI Provider](#auto-capture-ai-provider)).            |
-| `similarityThreshold` / `maxMemories`                                 | `0.6` / `10`                    | Minimum similarity score and maximum number of results for memory search.                                                       |
-| `injectProfile`                                                       | `true`                          | Inject the user profile (preferences, patterns, workflows) into the AI context.                                                 |
-| `deduplicationEnabled` / `deduplicationSimilarityThreshold`           | `true` / `0.9`                  | Detect and remove duplicate memories.                                                                                           |
-| `autoCleanupEnabled` / `autoCleanupRetentionDays`                     | `true` / `30`                   | At most once a day, delete prompts older than, and memories not updated within, the retention window. Pinned memories are kept. |
-| `showAutoCaptureToasts` / `showUserProfileToasts` / `showErrorToasts` | `true`                          | Toasts for auto-capture, profile updates and errors.                                                                            |
-| `autoUpdate`                                                          | `true`                          | Clear OpenCode's cached install when a newer npm release is available.                                                          |
-
-Profile context limits are set by `userProfileInjectPreferences` (default `5`), `userProfileInjectPatterns` (`5`), and `userProfileInjectWorkflows` (`3`). These control how many items are injected into the LLM conversation, not how many are displayed in the web UI. The legacy `maxProfileItems`, `userProfileDisplayPreferences`, `userProfileDisplayPatterns`, and `userProfileDisplayWorkflows` options are deprecated and have no effect. Existing config files still load, but you can remove these four keys.
-
-### Markdown vault backend (`memoryBackend`)
-
-By default memories live only in Turso under `storagePath`. Optionally set a **generic Markdown folder** as the source of truth (Obsidian/Raneto-compatible plain `.md` files — not an Obsidian-specific integration):
-
-```jsonc
-{
-  "memoryBackend": "markdown",
-  "markdownPath": "~/Documents/LLM-Wiki",
-}
-```
-
-Plugin-created vault files preserve capture provenance (`promptId`, `sessionID`, and `captureTimestamp`) so reindexing can restore those fields. Legacy files without them retain any corresponding metadata already in the index. Provenance already missing from both the file and the index cannot be recovered automatically.
-
-| Key             | Default      | What it does                                                                                                                                       |
-| --------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memoryBackend` | `"database"` | `"database"` keeps content in Turso. `"markdown"` uses all `.md` files under `markdownPath` as source of truth.                                    |
-| `markdownPath`  | —            | Required when `memoryBackend` is `"markdown"`. Absolute or `~/…` path to the vault folder. No separate memory subfolder — the path _is_ the store. |
-
-When Markdown mode is on:
-
-- Plugin-created memories are written as `{id}.md` with YAML frontmatter + body.
-- Existing notes in the folder (any Markdown page style) are imported/indexed; Turso is only a rebuildable semantic-search index.
-- File adds/edits/deletes are watched and re-indexed; the Web UI shows a **Markdown** sidebar page (status, file list, reindex) only in this mode.
-- Switching to Markdown rebuilds the index from the folder. DB-only rows without a matching file are dropped only after a readable, complete scan of a nonempty vault. Export with `memory export` first if you need to keep old database memories.
-- Reconciliation skips deletion and warns when the vault is missing, unreadable, only partially scanned or processed, or contains no Markdown files; existing indexed memories are retained. Restore or fix the vault, then reindex. To intentionally remove the final file's indexed memory, explicitly delete that memory through the tool or Web UI.
-- A healthy, nonempty vault still permits permanent deletion of indexed memories whose files are absent. Export or back up first: these safeguards are not a backup and cannot detect an incomplete sync that appears to be a healthy, nonempty vault.
-
-### Chat message capture and injection (`chatMessage`)
-
-These settings live under the `chatMessage` key in `~/.config/opencode/opencode-mem.jsonc`:
-
-| Option                                                 | Default          | What it does                                                                                                                                                                                                                                                                                           |
-| ------------------------------------------------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`                                              | `true`           | Capture authored user prompts and inject memory context.                                                                                                                                                                                                                                               |
-| `injectOn`                                             | `"first"`        | For `recall: "recent"`, inject on the first user message or on `"always"` every authored turn. With `recall: "relevant"` / `"both"`, context always refreshes each authored turn (issue #460).                                                                                                         |
-| `recall`                                               | `"relevant"`     | How injected memories are chosen: `"relevant"` embeds the user message and runs vector search each turn; `"recent"` keeps the legacy newest-N listing; `"both"` prefers relevant then fills remaining slots with recent.                                                                               |
-| `recallScope`                                          | `"default"`      | Scope for auto-recall: `"default"` follows `memory.defaultScope`, or force `"project"` / `"all-projects"`. When searching all projects, hits from the current project get a small similarity boost.                                                                                                    |
-| `similarityThreshold`                                  | (top-level)      | Optional per-inject floor; otherwise uses the top-level `similarityThreshold`.                                                                                                                                                                                                                         |
-| `maxMemories` / `excludeCurrentSession` / `maxAgeDays` | `3` / `true` / — | How many memories the injected context holds, whether memories captured in the current session are excluded, and an optional age cutoff in days.                                                                                                                                                       |
-| `filterInjectedPrompts`                                | `true`           | Skip prompt text injected by the host or by other OpenCode plugins (system reminders, orchestration directives, background-task notifications) so it is never stored as if the user had typed it.                                                                                                      |
-| `injectionMarkers`                                     | built-ins        | Extra markers identifying injected blocks; added to the built-in list, never replacing it.                                                                                                                                                                                                             |
-| `captureChildSessions`                                 | `false`          | Capture prompts from orchestrator child sessions (sessions with a `parentID`, e.g. OpenCode task/subagent children). Their "user" messages are written by the parent agent, not by you, so by default they are not stored, auto-captured, used for profile learning, or given injected memory context. |
-
-Session and age exclusions are applied before the injected memory limit, so excluded
-memories do not consume slots that could hold eligible memories. Setting
-`chatMessage.maxMemories` to `0` disables project-memory injection while still allowing
-the user profile to be injected when enabled.
-
-Injected memory tags identify `selection="recent"` or `selection="semantic"`.
-Recent selections (including fallback and recent fill in `both`) have no
-numeric score. Semantic selections carry a finite `retrieval_score` when available;
-this is a ranking signal that can include the current-project boost, not a probability
-of relevance or factual correctness. Missing or invalid scores are omitted. This
-replaces the former `relevance="...%"` prompt attribute without changing memory
-selection, ordering, content, or provenance. Compaction retains its existing format.
-
-When semantic recall fails (for example, embedding is unavailable), `relevant` and
-`both` fall back to the existing recent listing with the same scope, count, session,
-and age restrictions. A successful search with no eligible matches stays empty in
-`relevant`; `both` still fills from recent as usual. Partial-shard warnings do not
-trigger failure fallback. If recent fallback also fails, recall remains empty and
-nonfatal. Missing-query fallback and per-turn refresh behavior are unchanged.
-
-### Update-on-capture (optional)
-
-Opt-in path that keeps memories current as facts change. When `updateOnCaptureEnabled` is
-`true`, auto-capture embeds the new summary, searches for similar memories above
-`updateOnCaptureSimilarityThreshold` (default `0.75`), and asks the capture model to
-choose `add`, `update` (rewrite in place), or `supersede` (save new + soft-delete old into
-trash). Pinned memories are skipped. Default is off so existing installs keep add-only
-behavior.
-
-```jsonc
-"updateOnCaptureEnabled": true,
-"updateOnCaptureSimilarityThreshold": 0.75,
-"updateOnCaptureMaxCandidates": 5,
-```
-
-Tip: with `Xenova/nomic-embed-text-v1`, enabling `embeddingUseTaskPrefixes: true` (and
-optionally lowering recall `similarityThreshold`) often improves match quality for longer
-memories. Prefixes stay opt-in by default.
-
-### Dreaming (optional memory consolidation)
-
-Opt-in background pass that finds **related** memories (via `dreaming.relatedThreshold`,
-default `0.75`, independent of `deduplicationSimilarityThreshold`), asks the configured
-`opencodeProvider` / `opencodeModel` (with `memoryModel` / `memoryApiUrl` as fallback,
-same channel order as auto-capture) to `merge`, `update`, `supersede`, `keep`, or `flag`
-contradictions, and soft-deletes superseded rows into recoverable trash. Pinned memories
-are never touched. Set `dreaming.crossProject: true` (or `memory.defaultScope:
-"all-projects"`) to group across project tags; user-scope stays separate. Configure under
-`dreaming` in `opencode-mem.jsonc`. `dreaming.enabled` (default `false`) gates only the
-scheduled background run — the web UI **Dream** button and `POST /api/dreaming/run` still
-work when it is false (manual-only mode). Soft-deleted rows are hard-purged after
-`dreaming.trashRetentionDays` during normal cleanup. The web UI also exposes **Trash**
-(restore).
-
-### Choosing / configuring embeddings
-
-Embeddings power similarity search for memories and the user profile. Configure them in the same file (`~/.config/opencode/opencode-mem.jsonc`). There is **no MLX backend** — local embeddings use `@huggingface/transformers` with ONNX, not Apple MLX.
-
-**Local (default):** set only `embeddingModel`. On first use the model is downloaded from Hugging Face and cached under `{storagePath}/.cache` (default `~/.opencode-mem/data/.cache`). The weights stay resident for the life of the host process; set `embeddingIdleTimeoutMs` to release them after that many idle milliseconds, and the next memory operation re-warms them from the local cache (about a second, not a re-download).
-
-**Remote (OpenAI-compatible):** set both `embeddingApiUrl` and `embeddingApiKey`. The plugin then calls `{embeddingApiUrl}/embeddings` with a Bearer token. `embeddingApiKey` accepts the same secret formats as `memoryApiKey` (`literal`, `env://…`, `file://…`).
-
-| Key                        | Role                                                                                                                                             |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `embeddingModel`           | Hugging Face id (local) or API model name (remote). Default: `Xenova/nomic-embed-text-v1`                                                        |
-| `embeddingDimensions`      | Optional override; usually omit — dimensions are looked up from a built-in map                                                                   |
-| `embeddingPooling`         | Local pooling: `"mean"` (default), `"cls"`, or `"last_token"`. Unset → small known-model preset or `"mean"`                                      |
-| `embeddingQueryPrefix`     | Prefix for query-task embeddings. Unset → model preset or Nomic when `embeddingUseTaskPrefixes` is true. Explicit `""` disables                  |
-| `embeddingDocumentPrefix`  | Prefix for document-task embeddings (same resolution rules as `embeddingQueryPrefix`)                                                            |
-| `embeddingUseTaskPrefixes` | Opt-in Nomic `search_query:` / `search_document:` prefixes when custom/preset prefixes are unset. Default `false`                                |
-| `embeddingDtype`           | Optional local ONNX dtype override (e.g. `"q8"`, `"fp32"`). When set, passed to transformers.js `pipeline({ dtype })`                            |
-| `embeddingIdleTimeoutMs`   | Release the local model after this many idle milliseconds (e.g. `600000` for 10 minutes). `0` (default) keeps it loaded for the process lifetime |
-| `embeddingApiUrl`          | Base URL for an OpenAI-compatible embeddings API (no trailing path beyond `/v1`)                                                                 |
-| `embeddingApiKey`          | API key for that endpoint (required together with `embeddingApiUrl`)                                                                             |
-
-Recommended local models:
-
-| Model                                | Dims | Notes                                             |
-| ------------------------------------ | ---- | ------------------------------------------------- |
-| `Xenova/nomic-embed-text-v1`         | 768  | Default; multilingual, 8192 context; mean pooling |
-| `Xenova/jina-embeddings-v2-base-en`  | 768  | English-only, 8192 context                        |
-| `Xenova/jina-embeddings-v2-small-en` | 512  | Faster, 8192 context                              |
-| `Xenova/all-MiniLM-L6-v2`            | 384  | Very fast, 512 context                            |
-| `Xenova/all-mpnet-base-v2`           | 768  | Good quality, 512 context                         |
-| `Xenova/bge-m3`                      | 1024 | Multilingual; auto CLS pooling                    |
-| `intfloat/multilingual-e5-large`     | 1024 | Auto `query:` / `passage:` prefixes               |
-
-Example — remote OpenAI embeddings:
-
-```jsonc
-{
-  "embeddingApiUrl": "https://api.openai.com/v1",
-  "embeddingApiKey": "env://OPENAI_API_KEY",
-  "embeddingModel": "text-embedding-3-small",
-}
-```
-
-Example — local bge-m3 (pooling defaults to CLS via preset; override if needed):
-
-```jsonc
-{
-  "embeddingModel": "Xenova/bge-m3",
-  // "embeddingPooling": "cls",
-  // "embeddingDtype": "q8",
-}
-```
-
-Changing `embeddingModel`, dimensions, pooling, or task prefixes can require re-embedding stored memories so store and query vectors stay aligned. Prefer picking a model (and pooling/prefix settings) once and sticking with them for a given data directory.
-
-**Unsupported — Intel Mac (`darwin/x64`):** Local persistence requires `@tursodatabase/database`, which does not publish an Intel Mac native binding. Fixed `onnxruntime-node` releases (`1.24.1+`, including the pinned `1.31.1`) also lack darwin/x64. Use an Apple Silicon Mac, Linux, or Windows, or a remote endpoint via `embeddingApiUrl` + `embeddingApiKey` (example above). On supported platforms, `opencode-mem` pins `onnxruntime-node@1.31.1` (Ort::Env teardown fix from `1.24.1` / #225) and loads transformers through a CJS resolve shim so OpenCode nested installs keep that binding. Transformers is resolved to an absolute path before that shim is installed so OpenCode's Bun `--compile` host does not fail with `Cannot find module '@huggingface/transformers' from ''`. After upgrading, clear OpenCode's nested plugin cache (`~/.cache/opencode/packages/opencode-mem@*`) and reinstall.
-
-### Memory Scope
-
-- `scope: "project"`: query only the current project. This is the default.
-- `scope: "all-projects"`: query `search` / `list` across all project shards.
-- `memory.defaultScope` sets the default query scope when no explicit scope is provided.
-
-### Web UI HTTP Basic Auth
-
-When `webServerHost` is set to anything other than loopback (for example `0.0.0.0`), the web UI is reachable by anyone on the network. To keep your memories off the LAN, gate the web server with HTTP Basic Auth via the same config file used for everything else:
-
-```jsonc
-{
-  "webServerHost": "0.0.0.0", // optional: reach the UI from the LAN
-  "webServerAuthPassword": "pick-a-strong-one",
-  "webServerAuthUsername": "admin", // optional, defaults to the current OS user
-}
-```
-
-| Field                   | Default           | Effect                                                                                                                       |
-| ----------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `webServerAuthPassword` | _(empty)_         | When set, the server demands HTTP Basic Auth credentials on every request. Leave empty to keep the open-by-default behavior. |
-| `webServerAuthUsername` | OS user (`$USER`) | Username required by the Basic Auth challenge.                                                                               |
-
-`webServerAuthPassword` accepts the same secret formats as `memoryApiKey`:
-
-- a literal string (simple, fine for personal machines),
-- `env://SOME_ENV_VAR` to pull the value from the environment at startup,
-- `file:///path/to/secret` to read it from a file (`chmod 600` recommended — the plugin will warn if the file is world-readable).
-
-The browser will pop its native Basic Auth dialog and remember the credentials for the current session; closing all browser windows discards them, so reopening the browser requires signing in again. Credentials are compared with a constant-time check, and the unauthenticated 401 response carries `Cache-Control: no-store` so no intermediate cache will replay it. CORS is also relaxed once auth is on, so other tools on the same LAN can talk to the API after authenticating.
-
-### Sharing One Project Memory Across Nested Repos
-
-By default a project is identified by its enclosing git repository, so every
-physical git repo gets its own isolated memory store. That is wrong for
-multi-repo workspaces — trees managed by Google [`repo`](https://gerrit.googlesource.com/git-repo/+/HEAD/Docs/manual-repo.md),
-monorepos, or any layout where several nested git repositories belong to one
-logical project — because each sub-repository would be siloed.
-
-Drop an empty **`.opencode-mem-project`** marker file at the workspace root:
-
-```
-my-workspace/
-├── .opencode-mem-project   ← workspace root
-├── kernel/                 (own git repo)
-├── userspace/              (own git repo)
-└── tools/                  (own git repo)
-```
-
-Every session started anywhere underneath the marker then resolves onto that
-root and shares one memory store, regardless of which sub-repo the working
-directory lives in:
-
-```sh
-touch ~/my-workspace/.opencode-mem-project
-```
-
-The marker is looked up by walking up from the working directory that every
-code path already passes in (the plugin's working directory, the web API's
-`process.cwd()`), so identity is **directory-driven and process-independent**.
-It does not rely on environment variables or a global config value, which
-would be unreliable here: opencode-mem runs across multiple opencode processes
-that share a single web server, and only some of those processes carry a
-given env var. With the marker, the project root is always derived from where
-the session actually runs.
-
-The marker takes precedence over git detection. When it is present, the
-sub-repo's own git remote is intentionally ignored (it would describe only one
-nested repository). Without a marker, behavior is unchanged (git-based
-identity).
-
-### Moving or Recovering Project Memories
-
-opencode-mem keys project shards by a hash of the project identity. Moving a
-repository (OS migration, path reorganization, switching from a Windows mount
-to a native path) can therefore orphan the old shard under
-`~/.opencode-mem/data/projects/` while a new empty shard is created for the
-new path.
-
-These are OpenCode `memory` tool calls with JSON arguments, not commands to
-run in a terminal. The issue-style `memory migrate --from ...` notation maps
-to `memory({ mode: "migrate", fromPath: "..." })`.
-
-**1. Local move when you still know the old path**
-
-Open OpenCode in the **new** project directory. The target project must not
-already contain memories (migration aborts unchanged on conflict). Preview the
-detected source, destination, and file actions before changing anything:
-
-```typescript
-memory({ mode: "migrate", fromPath: "/old/path/to/project", dryRun: true });
-memory({ mode: "migrate", fromPath: "/old/path/to/project" });
-```
-
-For safety, migration refuses a source whose stored project directory still
-exists. If you intentionally want to move an active source, inspect the dry-run
-output first and then pass `allowLinkedSource: true`. Original source shard
-files are retained as timestamped `*.pre-path-migrate-*.bak` backups.
-
-**2. Old path is gone — discover the orphaned shard first**
-
-```typescript
-memory({ mode: "list-shards" });
-memory({ mode: "migrate", fromHash: "fa645294d88bbae2" });
-```
-
-`list-shards` reports each project hash, stored `projectPath`, memory count,
-and status (`current`, `linked`, `orphaned`, `missing-file`, `empty`, or
-`ambiguous`). `fromHash` is the 16-character lowercase hexadecimal `scopeHash`
-returned by this call. Prefer it when the old directory no longer exists or
-multiple shards contain the same stored path, because git-based identities
-cannot always be recomputed from a missing path.
-
-**3. Cross-machine backup / restore**
-
-```typescript
-// on the source machine / old checkout
-memory({ mode: "export", outputPath: "./memories.json" });
-
-// on the destination machine / new checkout
-memory({ mode: "import", inputPath: "./memories.json", dryRun: true });
-memory({ mode: "import", inputPath: "./memories.json" });
-```
-
-Export writes a versioned JSON document without vectors. Import remaps the
-memories onto the current project and recomputes embeddings with the currently
-configured model. Import adds memories to an existing project, but duplicate
-memory IDs abort the whole import before writing; this differs from `migrate`,
-which requires an empty target.
-
-Export files are plaintext and can contain memory content, user names/email
-addresses, repository URLs, and absolute project paths. Store them like other
-sensitive backups and delete them when no longer needed. Fully private entries
-are omitted, and user profiles and prompt history are not included. The
-document contains `schemaVersion: 1`; imports reject newer unsupported schema
-versions rather than guessing.
-
-### Auto-Capture AI Provider
-
-Auto-capture runs a background AI request to summarize technical work and save it as memory. It needs one of the provider configurations below.
-
-**Recommended:** Use a provider that is already authenticated in opencode and supports structured output:
-
-```jsonc
-"opencodeProvider": "anthropic",
-"opencodeModel": "claude-haiku-4-5-20251001",
-```
-
-The plugin issues structured-output requests to opencode's session API instead of calling provider endpoints directly, so opencode owns the auth, token refresh, and provider routing. The provider name must match an entry from `opencode providers list`, and the selected model must support structured JSON output through opencode.
-
-Optionally pin a model reasoning variant with `"opencodeVariant": "xhigh"` (e.g. for grok-4.7). It is applied to the plugin's internal LLM calls (auto-capture summaries, profile learning, profile cleanup), including when `opencodeModel` is `"inherit"`, so background work can use a different reasoning level than the interactive session.
-
-Slow reasoning models (or very large profile prompts) can exceed the default 90 s structured-output budget. Set `"opencodeTimeoutMs"` (milliseconds) to extend it for internal structured-output calls (auto-capture summaries, profile learning) — e.g. `"opencodeTimeoutMs": 180000` for 3 minutes. Values are clamped to 10000..600000; the default stays 90000. Numeric strings are coerced. Profile cleanup uses a separate, longer timeout.
-
-Supported providers: any provider listed by `opencode providers list` (e.g. `anthropic`, `openai`, `github-copilot`, `openrouter`, ...).
-
-**Built-in Free / Zen models** under provider id `opencode` (e.g. `big-pickle`) often cannot run the plugin’s internal structured-output sessions — OpenCode may reject them outside interactive chat. Prefer an authenticated provider from `opencode providers list`, or use `"opencodeModel": "inherit"` so capture follows the model you already use in the session.
-
-If `autoCaptureEnabled` is `true` (default) but neither `opencodeProvider`/`opencodeModel` nor a complete manual fallback is configured, the plugin logs a warning and shows a startup toast (when `showErrorToasts` is enabled) so missing config is visible without digging through logs.
-
-If `opencodeProvider` and `opencodeModel` are set, they take precedence over the manual `memoryProvider` settings below by default (`"autoCaptureProviderOrder": "opencode-first"`). Set `"autoCaptureProviderOrder": "external-first"` to prefer the manual API when both are configured (useful when the host session API is busy/slow); the other channel is used as fallback. Lower `"opencodeTimeoutMs"` to fail over from the opencode channel sooner.
-
-**Follow the session model:** set `"opencodeModel": "inherit"` to use a concrete OpenCode model at call time instead of a pinned id. For **auto-capture**, each prompt is recorded via the `chat.params` hook and the capture request reuses that prompt's provider/model. For **profile learning** and other structured-output paths (which are not tied to a single user message), `inherit` first reuses the last model the host reported on `chat.params` / the V2 context hook, then falls back to OpenCode's `model.json` recent list when present (preferring the configured `opencodeProvider`). OpenCode v2 no longer writes `model.json`, so the in-process session model is the primary fallback there. Sending the literal model id `inherit` is never valid and previously caused `ProviderModelNotFoundError: Model not found: <provider>/inherit` on those paths. `opencodeProvider` is still required as the normal config gate.
-
-**Fallback:** Manual API configuration (if not using opencodeProvider):
-
-```jsonc
-"memoryProvider": "openai-chat",
-"memoryModel": "gpt-4o-mini",
-"memoryApiUrl": "https://api.openai.com/v1",
-"memoryApiKey": "sk-...",
-```
-
-**API Key Formats:**
-
-```jsonc
-"memoryApiKey": "sk-..."
-"memoryApiKey": "file://~/.config/opencode/api-key.txt"
-"memoryApiKey": "env://OPENAI_API_KEY"
-```
-
-Manual `memoryProvider` modes:
-
-- `openai-chat`: OpenAI Chat Completions compatible API with tool/function calling. This can work with compatible proxies such as LiteLLM only when the selected upstream model and proxy preserve tool calls.
-- `openai-responses`: OpenAI Responses API with function-call output.
-- `anthropic`: Anthropic Messages API with tool use.
-- `minimax`: MiniMax Anthropic Messages-compatible endpoint. Set `memoryApiUrl` to the global endpoint (`https://api.minimax.io`) or the [China endpoint](https://platform.minimaxi.com/docs/api-reference/text-anthropic-api.md) (`https://api.minimax.cn`); the `/anthropic/v1/messages` path and `x-api-key` header are applied automatically. Use `MiniMax-M3.1-Flash` (recommended) or `MiniMax-M3`, both with a 1,000,000-token context. Flash always thinks; optionally set `memoryExtraParams` to `{ "output_config": { "effort": "max" } }` with `low`, `medium`, `high`, `xhigh`, or `max` (default). Flash rejects disabled thinking and effort `none`, and does not support `service_tier`. M3 thinking is off by default on this endpoint; enable it with `{ "thinking": { "type": "adaptive" } }`. Model IDs remain explicitly configured; existing custom or legacy IDs are passed through unchanged. See the [MiniMax compatibility reference](https://platform.minimax.io/docs/api-reference/text-anthropic-api.md).
-- `orcarouter`: OpenAI-compatible model gateway with namespaced model IDs. `memoryApiUrl` and `memoryModel` are optional — they default to `https://api.orcarouter.ai/v1` and `orcarouter/auto` (a routing alias that selects a capable model per request). If you set `memoryModel`, use a namespaced ID such as `openai/gpt-5.5` or `deepseek/deepseek-v4-flash`; OrcaRouter rejects bare model names. Example:
-  ```jsonc
-  "memoryProvider": "orcarouter",
-  "memoryApiKey": "<OrcaRouter API key>",
-  ```
-  [OrcaRouter](https://www.orcarouter.ai) also runs gateway-level, zero-trust security for AI agents on the same endpoint — screening every prompt/response and governing every tool call on a default-deny basis, with no application code changes.
-- `atlas-cloud`: OpenAI-compatible Chat Completions preset for [Atlas Cloud](https://www.atlascloud.ai). `memoryApiUrl` and `memoryModel` are optional — they default to `https://api.atlascloud.ai/v1` and `deepseek-ai/deepseek-v4-pro`. If `memoryApiKey` is omitted, `ATLASCLOUD_API_KEY` from the environment is used. Example:
-  ```jsonc
-  "memoryProvider": "atlas-cloud",
-  "memoryApiKey": "env://ATLASCLOUD_API_KEY",
-  ```
-  When this provider is selected, auto-capture / profile prompts, model responses, and relevant conversation context are transmitted to `https://api.atlascloud.ai`.
-- `cheaper-inference`: OpenAI-compatible Chat Completions preset for [Cheaper Inference](https://cheaperinference.com). `memoryApiUrl` and `memoryModel` are optional — they default to `https://api.cheaperinference.com/v1` and `gpt-5.4-mini`. If `memoryApiKey` is omitted, `CHEAPER_INFERENCE_API_KEY` from the environment is used. Example:
-  ```jsonc
-  "memoryProvider": "cheaper-inference",
-  "memoryApiKey": "env://CHEAPER_INFERENCE_API_KEY",
-  ```
-  When this provider is selected, auto-capture / profile prompts, model responses, and relevant conversation context are transmitted to `https://api.cheaperinference.com`.
-- `api-route`: OpenAI-compatible Chat Completions preset for [API Route](https://www.api-route.com/en/docs/quickstart). `memoryApiUrl` and `memoryModel` are optional — they default to `https://global.api-route.com/v1` and `gpt-6.1-sol`. If `memoryApiKey` is omitted, `API_ROUTE_API_KEY` from the environment is used. Example:
-  ```jsonc
-  "memoryProvider": "api-route",
-  "memoryApiKey": "env://API_ROUTE_API_KEY",
-  ```
-  When this provider is selected, auto-capture / profile prompts, model responses, and relevant conversation context are transmitted to `https://global.api-route.com`.
-- `runcrate`: OpenAI-compatible Chat Completions preset for [Runcrate](https://www.runcrate.ai). `memoryApiUrl` and `memoryModel` are optional — they default to `https://api.runcrate.ai/v1` and `deepseek-ai/DeepSeek-V4.1-Flash`. If `memoryApiKey` is omitted, `RUNCRATE_API_KEY` from the environment is used. Example:
-  ```jsonc
-  "memoryProvider": "runcrate",
-  "memoryApiKey": "env://RUNCRATE_API_KEY",
-  ```
-  When this provider is selected, auto-capture / profile prompts, model responses, and relevant conversation context are transmitted to `https://api.runcrate.ai`.
-- `cloudgpu`: OpenAI-compatible Chat Completions preset for [CloudGPU](https://cloudgpu.app). `memoryApiUrl` and `memoryModel` are optional — they default to `https://cloudgpu.app/v1` and `deepseek-v4.1-flash`. If `memoryApiKey` is omitted, `CLOUDGPU_API_KEY` from the environment is used (create a key at https://cloudgpu.app/api/console; API docs: https://cloudgpu.app/api/docs). Example:
-  ```jsonc
-  "memoryProvider": "cloudgpu",
-  "memoryApiKey": "env://CLOUDGPU_API_KEY",
-  ```
-  When this provider is selected, auto-capture / profile prompts, model responses, and relevant conversation context are transmitted to `https://cloudgpu.app`.
-- `standardcompute`: OpenAI-compatible Chat Completions preset for [Standard Compute](https://standardcompute.com). `memoryApiUrl` and `memoryModel` are optional — they default to `https://api.stdcmpt.com/v1` and `StandardCompute`. If `memoryApiKey` is omitted, `STANDARDCOMPUTE_API_KEY` from the environment is used (create a key at https://standardcompute.com/dashboard; API docs: https://docs.standardcompute.com). Example:
-  ```jsonc
-  "memoryProvider": "standardcompute",
-  "memoryApiKey": "env://STANDARDCOMPUTE_API_KEY",
-  ```
-  When this provider is selected, auto-capture / profile prompts, model responses, and relevant conversation context are transmitted to `https://api.stdcmpt.com`.
-
-Troubleshooting:
-
-- Auto-capture failures do not block manual `memory` tool usage.
-- Auto-capture preserves bounded final assistant text and terminal tool outcomes from
-  delivered V1/V2 events before the delayed summarization runs. Normal idle capture still
-  prefers the live host transcript; ready pending evidence is the fallback when the session
-  is already gone (deletion or startup replay). Recovery is scoped to the same project
-  and uses the normal capture provider and claim queue. It does not infer completed work
-  from the request alone. Deleting an OpenCode session does **not** delete this pending
-  memory evidence or already captured memories.
-- Pending evidence is private-tag redacted before persistence (including tags spanning
-  final text parts within one assistant message); reasoning, attachments, raw provider
-  metadata, streaming deltas, and tool arguments are excluded. Limits are 16 KiB per
-  part, 16 parts per prompt, 256 parts globally (at most 4 MiB of text), and 64 KiB per
-  capture. Truncation is marked; oldest parts are evicted when the budget is exceeded.
-  Evidence expires after 24 hours and is pruned on subsequent store access. It is cleared
-  when capture finishes/skips or its prompt is removed by existing deletion/retention
-  paths. These are logical retention limits, not secure erasure of SQLite/WAL backups.
-- V2 events are a volatile stream: disconnected/missed events, unresolvable prompt
-  association, and evidence lost to expiry/eviction cannot be recovered. The guarantee
-  is capture from evidence received, saved, and checkpointed ready by an idle/deleted
-  event, not reconstruction of unseen or previously deleted transcripts. After that
-  checkpoint the session is sealed against late rebinds until the next authored user
-  input (V2 `session.inbox.delivered`, V1 user `message.updated`), so buffered parts
-  cannot flip ready evidence back to unreadiness. A disconnect before the terminal
-  checkpoint leaves the partial evidence deferred until a later checkpoint; restart
-  does not assume unfinished work is complete. V1 uses explicit assistant parent IDs;
-  V2 freezes the delivered input at step start rather than guessing the latest queued
-  prompt.
-- If the live host reports `Session.NotFoundError` (or deletion/startup replay has no
-  ready evidence), capture logs `skipped` / `session_not_found`, releases its claim
-  without backoff or consuming retries, and skips further host-dependent lookups in that
-  batch. Later prompts with ready saved evidence still proceed. A later independent idle
-  may retry. Already exhausted prompts are not revived. Other failures retain their
-  existing retry behavior.
-- Auto-capture additions use a stable per-project/prompt ID so sequential crash/restart
-  replay reuses the prior memory, including soft-deleted records, instead of inserting or
-  resurrecting it. This does not claim distributed exactly-once semantics for optional
-  semantic update/supersede operations or every multi-process crash interleaving.
-- If auto-capture reports that a provider is not connected, confirm the provider name with `opencode providers list` and configure that provider in opencode first.
-- If a proxy or custom provider returns plain text instead of structured/tool output, choose another model/provider or use one of the manual provider modes above.
-- For models that reject `temperature`, add `"memoryTemperature": false` when using manual API configuration.
-- For models that reject forced tool calls (`tool_choice: "required"`, e.g. some thinking modes), add `"forceToolChoice": false` when using `openai-chat` / `orcarouter` / `atlas-cloud` / `cheaper-inference` / `api-route` / `runcrate` / `cloudgpu` / `standardcompute`.
-- For `opencodeProvider` / `opencodeModel` (e.g. DeepSeek V4 thinking), OpenCode still sends forced `tool_choice` for structured output. opencode-mem disables thinking on the internal `opencode-mem-structured` agent (and re-applies that in `chat.params` after variant merge) so auto-capture and profile learning can complete. Your interactive chat agent is unchanged. If capture still fails with a thinking/`tool_choice` error, pick a non-thinking model for `opencodeModel` or configure a complete manual fallback (`memoryModel` + `memoryApiUrl`).
-- **`opencode-claude-auth` / Claude Code:** auto-capture uses OpenCode with your authenticated `anthropic` provider. Forced `format: json_schema` often loops with Claude-auth, so opencode-mem uses an auth-preserving **text-JSON** path for `opencodeProvider: "anthropic"` (no forced `StructuredOutput` tools; reply is parsed with Zod). A step watchdog still aborts runaway internal sessions after 2 steps. If capture still fails, configure a complete manual Anthropic API-key fallback (`memoryProvider: "anthropic"` + `memoryModel` + `memoryApiUrl` + `memoryApiKey`) — Claude Pro/Max OAuth cannot be reused outside OpenCode.
-- **Unsupported platforms:** Intel Mac (`darwin/x64`) is not supported — `@tursodatabase/database` and fixed `onnxruntime-node` releases (pinned `1.31.1`) ship no x64 native binding. Use Apple Silicon, Linux, or Windows, or a remote embedding endpoint via `embeddingApiUrl` + `embeddingApiKey`. MLX is not supported.
-
-## Public Subpath Exports
-
-In addition to the main plugin entry, `opencode-mem` exposes one stable subpath
-that other opencode plugins can import directly. This avoids having to
-reverse-engineer container-tag conventions when writing third-party tools that
-read or write into the same memory store.
-
-### `opencode-mem/tags`
-
-Canonical container-tag helpers. The same functions opencode-mem itself uses
-to scope auto-captured memories.
-
-```ts
-import { getProjectTagInfo, getUserTagInfo, getTags } from "opencode-mem/tags";
-
-// Canonical project tag derived from cwd (git remote URL if present, else
-// the project root path). Format: `opencode_project_<sha16>`.
-const projectTag = getProjectTagInfo(process.cwd()).tag;
-
-// Canonical user tag derived from `git config user.email`.
-// Format: `opencode_user_<sha16>`.
-const userTag = getUserTagInfo().tag;
-
-// Both at once.
-const { user, project } = getTags(process.cwd());
-```
-
-Tags produced by these helpers match what auto-capture writes, so third-party
-plugins that call `POST /api/memories` will land in the same shards the rest
-of the system already understands. Hand-rolled tags whose substring isn't
-`_project_` or `_user_` end up in shadow shards that `/api/stats` and
-`/api/memories` silently filter out — using these helpers avoids that pitfall.
-
-## Development & Contribution
-
-Build and test locally:
+## 安装
 
 ```bash
 bun install
 bun run build
-bun test
-bun run check
 ```
 
-`bun run check` runs `format:check`, `lint` and `typecheck`; `bun run format` rewrites formatting.
+在 OpenCode 的插件配置中加载本包（`dist/plugin.js` 为入口）。插件使用 OpenCode v2 插件 API，`package.json` 已声明 `"opencode": { "type": "plugin" }`。
 
-The [docs](https://opencode-mem.zhafron.my.id/docs/) are generated from this README and the translations under `.github/i18n/`; the [landing page](https://opencode-mem.zhafron.my.id) lives in `github-site/src/`. Every README heading must be mapped to a docs page in `github-site/docs-map.json`, otherwise the site build fails. Build the site locally with `cd github-site && bun install && bun run build`.
+## 开发
 
-This project is actively seeking contributions to become the definitive memory plugin for AI coding agents. Whether you are fixing bugs, adding features, improving documentation, or expanding embedding model support, your contributions are critical. The codebase is well-structured and ready for enhancement. Please open issues with the Issue or Feature request templates, and fill out the pull request template when you submit a PR — we review and merge contributions quickly.
+```bash
+bun run typecheck
+bun run build
+bun test
+bun run scripts/smoke.ts   # 真实模型 + Turso + 相似度校准，需要下载 ONNX 权重
+```
 
-**README translations:** `README.md` (English) is the source of truth. When you change its content, update the files under `.github/i18n/` (`README.de.md`, `README.zh.md`, `README.ar.md`, `README.tr.md`, and `README.nl.md`) to match.
+## 许可
 
-## License & Links
-
-MIT License - see LICENSE file
-
-- **Website**: https://opencode-mem.zhafron.my.id
-- **Docs**: https://opencode-mem.zhafron.my.id/docs/
-- **Repository**: https://github.com/tickernelz/opencode-mem
-- **Issues**: https://github.com/tickernelz/opencode-mem/issues
-- **npm**: https://www.npmjs.com/package/opencode-mem
-- **OpenCode Platform**: https://opencode.ai
-
-Inspired by [opencode-supermemory](https://github.com/supermemoryai/opencode-supermemory)
+MIT。本项目 fork 自 [`tickernelz/opencode-mem`](https://github.com/tickernelz/opencode-mem)，保留原作者版权声明，详见 [`LICENSE`](./LICENSE)。

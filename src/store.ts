@@ -1,0 +1,457 @@
+import { connect, type Database } from "@tursodatabase/database";
+import type { EncryptionOpts } from "@tursodatabase/database-common";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+export const CATEGORIES = [
+  "domain_rule",
+  "arch_decision",
+  "data_constraint",
+  "pitfall",
+] as const;
+export type MemoryCategory = (typeof CATEGORIES)[number];
+
+export const SOURCES = ["auto", "manual", "import"] as const;
+export type MemorySource = (typeof SOURCES)[number];
+
+export type MemoryStatus = "active" | "archived";
+
+export interface MemoryRecord {
+  id: string;
+  title: string;
+  category: MemoryCategory;
+  content: string;
+  related_files: string[];
+  source: MemorySource;
+  source_ref: string | null;
+  status: MemoryStatus;
+  review_note: string | null;
+  version: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface MemorySearchHit extends MemoryRecord {
+  similarity: number;
+}
+
+export interface NearestMemory {
+  id: string;
+  title: string;
+  source: MemorySource;
+  similarity: number;
+}
+
+export interface StoreOptions {
+  dbPath: string;
+  dimensions: number;
+  model: string;
+  encryption?: EncryptionOpts | null;
+}
+
+const SCHEMA_VERSION = "1";
+
+function parseRelatedFiles(value: unknown): string[] {
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToRecord(row: Record<string, unknown>): MemoryRecord {
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    category: String(row.category) as MemoryCategory,
+    content: String(row.content),
+    related_files: parseRelatedFiles(row.related_files),
+    source: String(row.source) as MemorySource,
+    source_ref: row.source_ref == null ? null : String(row.source_ref),
+    status: String(row.status) as MemoryStatus,
+    review_note: row.review_note == null ? null : String(row.review_note),
+    version: Number(row.version),
+    created_at: Number(row.created_at),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+function escapeLike(token: string): string {
+  return token.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[\s,，。；;:：、/\\|()（）[\]{}<>《》"'`]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2)
+    .slice(0, 16);
+}
+
+/**
+ * One SQLite/Turso database per project. Schema v1 is created from scratch;
+ * pre-existing databases with unknown schema are refused, never migrated.
+ */
+export class MemoryStore {
+  private db: Database | null = null;
+  private opening: Promise<Database> | null = null;
+
+  constructor(private readonly options: StoreOptions) {}
+
+  async open(): Promise<void> {
+    await this.connection();
+  }
+
+  async close(): Promise<void> {
+    const db = this.db;
+    this.db = null;
+    this.opening = null;
+    await db?.close();
+  }
+
+  private async connection(): Promise<Database> {
+    if (this.db) return this.db;
+    if (this.opening) return this.opening;
+
+    this.opening = (async () => {
+      mkdirSync(dirname(this.options.dbPath), { recursive: true });
+      const experimental: Array<"encryption" | "multiprocess_wal"> = ["encryption"];
+      if (process.platform !== "win32") experimental.push("multiprocess_wal");
+      const db = await connect(this.options.dbPath, {
+        experimental,
+        ...(this.options.encryption ? { encryption: this.options.encryption } : {}),
+        timeout: 10_000,
+      });
+      await this.initialize(db);
+      this.db = db;
+      return db;
+    })();
+
+    try {
+      return await this.opening;
+    } finally {
+      this.opening = null;
+    }
+  }
+
+  private async initialize(db: Database): Promise<void> {
+    const existing = (await db.get(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+    )) as { name?: string } | null;
+    const hasMeta = (await db.get(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'project_meta'"
+    )) as { name?: string } | null;
+    const version = hasMeta ? await this.getMetaWith(db, "schema_version") : null;
+
+    if (!existing && !hasMeta) {
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS project_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memories (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          category TEXT NOT NULL CHECK (category IN ('domain_rule','arch_decision','data_constraint','pitfall')),
+          content TEXT NOT NULL,
+          related_files TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL CHECK (source IN ('auto','manual','import')),
+          source_ref TEXT,
+          status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+          review_note TEXT,
+          version INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          vector F32_BLOB(${this.options.dimensions}) NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_status_updated ON memories(status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+      `);
+      await db.batch(
+        [
+          {
+            sql: "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
+            args: ["schema_version", SCHEMA_VERSION],
+          },
+          {
+            sql: "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
+            args: ["embedding_model", this.options.model],
+          },
+          {
+            sql: "INSERT OR IGNORE INTO project_meta (key, value) VALUES (?, ?)",
+            args: ["embedding_dimensions", String(this.options.dimensions)],
+          },
+        ],
+        "immediate"
+      );
+      return;
+    }
+
+    if (!hasMeta || !existing) {
+      throw new Error(
+        `项目数据库 ${this.options.dbPath} 结构不完整（memories/project_meta 缺失）。新项目只支持全新 schema v1，请移走旧数据库。`
+      );
+    }
+    if (version === null) {
+      throw new Error(
+        `项目数据库 ${this.options.dbPath} 缺少 schema_version。新项目只支持全新 schema v1，请移走旧数据库。`
+      );
+    }
+    if (version !== SCHEMA_VERSION) {
+      throw new Error(
+        `项目数据库 schema 版本为 ${version}，当前插件只支持 v${SCHEMA_VERSION}。请使用旧版本导出后再重建。`
+      );
+    }
+
+    const model = await this.getMetaWith(db, "embedding_model");
+    const dimensions = await this.getMetaWith(db, "embedding_dimensions");
+    if (model !== this.options.model) {
+      throw new Error(
+        `Embedding 模型不匹配：库由 ${model ?? "未知模型"} 建立，当前配置为 ${this.options.model}。请改回原模型或重建库。`
+      );
+    }
+    if (dimensions !== String(this.options.dimensions)) {
+      throw new Error(
+        `Embedding 维度不匹配：库为 ${dimensions ?? "未知"} 维，当前配置为 ${this.options.dimensions} 维。请改回原维度或重建库。`
+      );
+    }
+  }
+
+  private async getMetaWith(db: Database, key: string): Promise<string | null> {
+    const row = (await db.get("SELECT value FROM project_meta WHERE key = ?", key)) as
+      | { value?: string }
+      | null;
+    return row?.value ?? null;
+  }
+
+  async getMeta(key: string): Promise<string | null> {
+    return this.getMetaWith(await this.connection(), key);
+  }
+
+  async setMeta(key: string, value: string): Promise<void> {
+    const db = await this.connection();
+    await db.run(
+      "INSERT INTO project_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      key,
+      value
+    );
+  }
+
+  async recordProject(info: { identity: string; root: string; name: string }): Promise<void> {
+    await this.setMeta("project_identity", info.identity);
+    await this.setMeta("project_path", info.root);
+    await this.setMeta("project_name", info.name);
+  }
+
+  async getOverview(): Promise<string> {
+    return (await this.getMeta("overview")) ?? "";
+  }
+
+  async setOverview(content: string): Promise<void> {
+    await this.setMeta("overview", content);
+  }
+
+  async insert(record: MemoryRecord, vector: Float32Array): Promise<void> {
+    const db = await this.connection();
+    await db.run(
+      `INSERT INTO memories (
+        id, title, category, content, related_files, source, source_ref,
+        status, review_note, version, created_at, updated_at, vector
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?, ?, vector32(?))`,
+      record.id,
+      record.title,
+      record.category,
+      record.content,
+      JSON.stringify(record.related_files),
+      record.source,
+      record.source_ref,
+      record.created_at,
+      record.updated_at,
+      JSON.stringify(Array.from(vector))
+    );
+  }
+
+  async update(
+    record: MemoryRecord,
+    expectedVersion: number,
+    vector: Float32Array
+  ): Promise<number> {
+    const db = await this.connection();
+    const result = await db.run(
+      `UPDATE memories
+       SET title = ?, category = ?, content = ?, related_files = ?, source_ref = ?,
+           version = version + 1, updated_at = ?, vector = vector32(?)
+       WHERE id = ? AND status = 'active' AND version = ?`,
+      record.title,
+      record.category,
+      record.content,
+      JSON.stringify(record.related_files),
+      record.source_ref,
+      record.updated_at,
+      JSON.stringify(Array.from(vector)),
+      record.id,
+      expectedVersion
+    );
+    return Number(result.changes);
+  }
+
+  async archive(id: string, expectedVersion: number, updatedAt: number): Promise<number> {
+    const db = await this.connection();
+    const result = await db.run(
+      `UPDATE memories
+       SET status = 'archived', version = version + 1, updated_at = ?
+       WHERE id = ? AND status = 'active' AND version = ?`,
+      updatedAt,
+      id,
+      expectedVersion
+    );
+    return Number(result.changes);
+  }
+
+  async getById(id: string): Promise<MemoryRecord | null> {
+    const db = await this.connection();
+    const row = await db.get("SELECT * FROM memories WHERE id = ?", id);
+    return row ? rowToRecord(row as Record<string, unknown>) : null;
+  }
+
+  async findNearest(vector: Float32Array, limit = 1): Promise<NearestMemory[]> {
+    const db = await this.connection();
+    const json = JSON.stringify(Array.from(vector));
+    const rows = (await db.all(
+      `SELECT id, title, source,
+              1 - vector_distance_cos(vector, vector32(?)) AS similarity
+       FROM memories
+       WHERE status = 'active'
+       ORDER BY vector_distance_cos(vector, vector32(?)) ASC
+       LIMIT ?`,
+      json,
+      json,
+      limit
+    )) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      title: String(row.title),
+      source: String(row.source) as MemorySource,
+      similarity: Math.max(0, Math.min(1, Number(row.similarity))),
+    }));
+  }
+
+  /** Keyword + vector hybrid search over active memories. */
+  async search(query: string, vector: Float32Array, limit: number): Promise<MemorySearchHit[]> {
+    const db = await this.connection();
+    const json = JSON.stringify(Array.from(vector));
+    const candidateLimit = Math.max(limit * 3, 20);
+    const candidates = new Map<string, { similarity: number; keyword: number }>();
+
+    const vectorRows = (await db.all(
+      `SELECT id, 1 - vector_distance_cos(vector, vector32(?)) AS similarity
+       FROM memories
+       WHERE status = 'active'
+       ORDER BY vector_distance_cos(vector, vector32(?)) ASC
+       LIMIT ?`,
+      json,
+      json,
+      candidateLimit
+    )) as Array<Record<string, unknown>>;
+    for (const row of vectorRows) {
+      candidates.set(String(row.id), {
+        similarity: Math.max(0, Math.min(1, Number(row.similarity))),
+        keyword: 0,
+      });
+    }
+
+    const tokens = tokenize(query);
+    if (tokens.length > 0) {
+      const keywordCounts = new Map<string, number>();
+      for (const token of tokens) {
+        const pattern = `%${escapeLike(token)}%`;
+        const rows = (await db.all(
+          `SELECT id FROM memories
+           WHERE status = 'active'
+             AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR related_files LIKE ? ESCAPE '\\')
+           LIMIT ?`,
+          pattern,
+          pattern,
+          pattern,
+          candidateLimit
+        )) as Array<{ id?: string }>;
+        for (const row of rows) {
+          const id = String(row.id);
+          keywordCounts.set(id, (keywordCounts.get(id) ?? 0) + 1);
+        }
+      }
+      for (const [id, count] of keywordCounts) {
+        const existing = candidates.get(id);
+        const keyword = count / tokens.length;
+        if (existing) existing.keyword = keyword;
+        else candidates.set(id, { similarity: 0, keyword });
+      }
+    }
+
+    const ids = [...candidates.keys()];
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = (await db.all(
+      `SELECT *, 1 - vector_distance_cos(vector, vector32(?)) AS similarity
+       FROM memories
+       WHERE status = 'active' AND id IN (${placeholders})`,
+      json,
+      ...ids
+    )) as Array<Record<string, unknown>>;
+
+    const hasKeyword = tokens.length > 0;
+    const hits = rows.map((row) => {
+      const record = rowToRecord(row);
+      const candidate = candidates.get(record.id) ?? { similarity: 0, keyword: 0 };
+      const similarity = hasKeyword
+        ? candidate.similarity * 0.7 + candidate.keyword * 0.3
+        : candidate.similarity;
+      return { ...record, similarity };
+    });
+    hits.sort((a, b) => b.similarity - a.similarity);
+    return hits.slice(0, limit);
+  }
+
+  async listActiveTitles(limit: number): Promise<Array<Pick<MemoryRecord, "id" | "category" | "title">>> {
+    const db = await this.connection();
+    const rows = (await db.all(
+      `SELECT id, category, title FROM memories
+       WHERE status = 'active'
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+      limit
+    )) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      category: String(row.category) as MemoryCategory,
+      title: String(row.title),
+    }));
+  }
+
+  async countActive(): Promise<number> {
+    const db = await this.connection();
+    const row = (await db.get("SELECT COUNT(*) AS count FROM memories WHERE status = 'active'")) as
+      | { count?: number }
+      | null;
+    return Number(row?.count ?? 0);
+  }
+
+  async listActive(): Promise<MemoryRecord[]> {
+    const db = await this.connection();
+    const rows = (await db.all(
+      "SELECT * FROM memories WHERE status = 'active' ORDER BY updated_at DESC"
+    )) as Array<Record<string, unknown>>;
+    return rows.map(rowToRecord);
+  }
+
+  async listArchived(): Promise<MemoryRecord[]> {
+    const db = await this.connection();
+    const rows = (await db.all(
+      "SELECT * FROM memories WHERE status = 'archived' ORDER BY updated_at DESC"
+    )) as Array<Record<string, unknown>>;
+    return rows.map(rowToRecord);
+  }
+}
