@@ -3,11 +3,19 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { stripJsoncComments } from "./services/jsonc.js";
 import { resolveSecretValue } from "./services/secret-resolver.js";
-import { isPlaceholderApiKey } from "./services/ai/api-key-placeholder.js";
-import {
-  isMemoryProviderPreset,
-  resolveMemoryProviderPresetDefaults,
-} from "./services/ai/memory-provider-presets.js";
+function isPlaceholderApiKey(value: string | undefined | null): boolean {
+  return /^(?:YOUR_|REPLACE_|EXAMPLE_|TOKEN_PLACEHOLDER$)/.test((value ?? "").trim());
+}
+
+function isMemoryProviderPreset(_value: unknown): boolean {
+  return false;
+}
+
+function resolveMemoryProviderPresetDefaults(
+  _value: unknown
+): { model?: string; apiUrl?: string } | undefined {
+  return undefined;
+}
 import { getDefaultInjectionMarkers } from "./services/injected-prompt-filter.js";
 
 const CONFIG_DIR = join(homedir(), ".config", "opencode");

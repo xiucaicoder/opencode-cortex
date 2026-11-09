@@ -1,7 +1,7 @@
 {
-  "name": "opencode-mem",
-  "version": "2.42.0",
-  "description": "OpenCode plugin that gives coding agents persistent memory using local Turso/libSQL vector search",
+  "name": "opencode-cortex",
+  "version": "0.1.0",
+  "description": "Project-level business and architecture memory plugin for OpenCode",
   "type": "module",
   "main": "dist/plugin.js",
   "types": "dist/plugin.d.ts",
@@ -9,22 +9,6 @@
     ".": {
       "import": "./dist/plugin.js",
       "types": "./dist/plugin.d.ts"
-    },
-    "./server": {
-      "import": "./dist/plugin.js",
-      "types": "./dist/plugin.d.ts"
-    },
-    "./v2": {
-      "import": "./dist/v2/plugin.js",
-      "types": "./dist/v2/plugin.d.ts"
-    },
-    "./tui": {
-      "import": "./dist/tui.js",
-      "types": "./dist/tui.d.ts"
-    },
-    "./tags": {
-      "import": "./dist/services/tags.js",
-      "types": "./dist/services/tags.d.ts"
     }
   },
   "scripts": {
@@ -42,36 +26,18 @@
     "opencode",
     "plugin",
     "memory",
-    "vector-database",
-    "ai",
-    "coding-agent",
-    "local",
-    "standalone"
+    "architecture",
+    "business-rules"
   ],
-  "author": "opencode-mem",
+  "author": "opencode-cortex",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/tickernelz/opencode-mem.git"
-  },
-  "homepage": "https://opencode-mem.zhafron.my.id",
-  "bugs": {
-    "url": "https://github.com/tickernelz/opencode-mem/issues"
-  },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.3.1",
-    "@libsql/client": "^0.18.0",
-    "@opencode-ai/plugin": "^1.19.0",
-    "@opencode-ai/sdk": "^1.19.0",
-    "@opencode/plugin": "^2.0.27",
     "@tursodatabase/database": "^0.8.3",
-    "franc-min": "^6.2.0",
-    "iso-639-3": "^3.0.1",
-    "onnxruntime-node": "1.31.1",
-    "zod": "^4.6.7"
+    "onnxruntime-node": "1.31.1"
   },
   "//": "Pin latest stable onnxruntime-node@1.31.1 (direct + override) with @huggingface/transformers: nested OpenCode installs ignore package overrides (#184); Ort::Env teardown fix shipped in 1.24.1 (#225). Intel Mac (darwin/x64) is unsupported \u2014 @tursodatabase/database and fixed onnxruntime releases ship no x64 binding.",
   "overrides": {
@@ -88,15 +54,11 @@
     "lint-staged": "^17.6.0",
     "prettier": "^3.9.10",
     "typescript": "6.0.3",
-    "typescript-eslint": "^8.71.2"
+    "typescript-eslint": "^8.71.2",
+    "@opencode/plugin": "^2.2.5"
   },
   "opencode": {
-    "type": "plugin",
-    "hooks": [
-      "chat.message",
-      "chat.params",
-      "event"
-    ]
+    "type": "plugin"
   },
   "files": [
     "dist",
@@ -110,5 +72,8 @@
     "*.{css,html,json,jsonc,md,yml,yaml}": [
       "prettier --write"
     ]
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.0"
   }
 }
