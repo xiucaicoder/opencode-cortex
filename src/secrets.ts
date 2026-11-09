@@ -33,7 +33,7 @@ const BUILT_IN: Rule[] = [
 function compileExtra(patterns: string[]): Rule[] {
   return patterns.map((source, index) => {
     try {
-      return { name: `blockedPatterns[${index}]`, pattern: new RegExp(source, "i") };
+      return { name: `blockedPatterns[${index}]`, pattern: new RegExp(source, "gi") };
     } catch (error) {
       throw new Error(
         `配置项 blockedPatterns[${index}] 不是合法正则：${error instanceof Error ? error.message : String(error)}`
@@ -72,4 +72,29 @@ export function findBlockedField(
     if (rule) return { field, rule };
   }
   return null;
+}
+
+export interface RedactionResult {
+  text: string;
+  hits: number;
+  rules: string[];
+}
+
+/**
+ * Replace every secret match with [REDACTED] before text leaves the process.
+ * The matched substrings are never returned or logged.
+ */
+export function redactSecrets(text: string, extraPatterns: string[] = []): RedactionResult {
+  const rules = [...BUILT_IN, ...compileExtra(extraPatterns)];
+  let hits = 0;
+  const matched = new Set<string>();
+  let result = text;
+  for (const rule of rules) {
+    result = result.replace(rule.pattern, () => {
+      hits++;
+      matched.add(rule.name);
+      return "[REDACTED]";
+    });
+  }
+  return { text: result, hits, rules: [...matched] };
 }

@@ -79,7 +79,7 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService):
     editor.add({
       name: "memory_search",
       description:
-        "检索本项目已沉淀的业务规则、架构决策、数据约束和踩坑记录。仅返回 active 条目。需要更新或归档时，使用返回的 id 和 version。",
+        "检索本项目已沉淀的业务规则、架构决策、数据约束和踩坑记录。在修改业务逻辑、数据结构或状态流转之前，必须先调用本工具确认既有约束，避免只按代码字面实现而违反业务规则。仅返回 active 条目；需要修改或归档时，使用返回的 id 和 version。",
       input: SEARCH_INPUT as unknown as never,
       execute: async (args: { query?: string; limit?: number }) => {
         try {
@@ -94,7 +94,7 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService):
     editor.add({
       name: "memory_mutate",
       description:
-        "写入项目记忆。content 最多 200 字；category 必须是四类之一；update/delete 必须带 id 和 version。add 前会做相似去重；命中重复时请用 update 合并。add 成功后会在 related 中返回最相近的已有条目，请据此判断是否应改为 update。",
+        "写入项目记忆。仅在开发者明确确认了新的业务规则、架构决策、数据约束或踩坑结论后调用；AI 自己的推测、未验证方案和调试过程不要写入。修改已有条目之前先调用 memory_search 获取 id 和 version，update/delete 必须带 id 和 version。content 最多 200 字，category 必须是四类之一；add 前会做相似去重，命中重复时请用 update 合并；add 成功后会在 related 中返回最相近的已有条目，请据此判断是否应改为 update。",
       input: MUTATE_INPUT as unknown as never,
       execute: async (args: MutateInput) => {
         try {

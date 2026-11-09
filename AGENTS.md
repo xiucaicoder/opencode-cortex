@@ -44,7 +44,11 @@ bun run scripts/smoke.ts
 - No timers for background work; stage 2/3 run off session events.
 - Injection sends only the ≤500-char overview plus `[id] [category] title` lines (max 150, newest first). Never inject memory bodies.
 - `injectOn: "first"` caches one block per session; compaction must clear the cache so the next request reloads it.
-- Auto extraction reads only the increment after `session_state.last_extracted_message_id`, runs at most one model call per idle, and advances the watermark before the call. Failures are logged and never retried automatically.
+- Auto extraction reads only the increment after `session_state.last_extracted_message_id`, runs at most one model call per idle, and skips sub-sessions (`parentID` set).
+- The watermark advances only after a successful model reply or a non-retryable failure (invalid JSON/validation). Timeout, rate-limit and network failures keep it in place, use `failureCooldownMinutes`, and give up after 2 attempts.
+- Conversation text is redacted with the same rules as writes before it is sent to the model; never log matched content.
+- `autoCaptureDryRun` appends candidates to `dry-run.jsonl` instead of writing memories.
+- New memory ids are 8 hex characters; collision retries may lengthen them.
 - Auto extraction may only add/update its own `auto` entries. It cannot delete, and it cannot modify `manual` / `import` entries.
 - Auto-generated adds that closely match a non-auto entry are dropped instead of written.
 - Extraction model is fixed (`opencodeModel`, default `opencode-go/glm-5.3-flash`) with optional `opencodeVariant`; do not default to inherit. Output must be Chinese JSON only.

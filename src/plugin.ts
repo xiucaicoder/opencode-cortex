@@ -57,6 +57,7 @@ const OpenCodeCortexPlugin: Plugin = {
         config.injectMaxTitles
       )
     );
+    const pendingReinject = new Set<string>();
 
     await ctx.session.hook("prompt", async (event) => {
       if (config.injectOn === "always") injectionCache.clear(event.sessionID);
@@ -66,6 +67,12 @@ const OpenCodeCortexPlugin: Plugin = {
       try {
         const text = await injectionCache.get(event.sessionID);
         if (text) event.system.push({ type: "text", text });
+        if (pendingReinject.delete(event.sessionID)) {
+          log("memory context: reinjected after compaction", {
+            session_id: event.sessionID,
+            injected: Boolean(text),
+          });
+        }
       } catch (error) {
         log("memory context injection failed", { error: errorMessage(error) });
       }
@@ -87,14 +94,28 @@ const OpenCodeCortexPlugin: Plugin = {
       if (!config.autoExtract.enabled) return;
       if (running.has(event.sessionID)) return;
       running.add(event.sessionID);
-      void runAutoExtraction(event.sessionID, config, {
-        service,
-        generate,
-        readPrompt: readExtractionPrompt,
-        getMessages,
-      })
-        .catch((error) => log("auto extraction: unexpected", { error: errorMessage(error) }))
-        .finally(() => running.delete(event.sessionID));
+      void (async () => {
+        try {
+          const info = await ctx.session.get({ sessionID: event.sessionID });
+          if (info.parentID) {
+            log("auto extraction: skipped sub-session", {
+              session_id: event.sessionID,
+              parent_id: info.parentID,
+            });
+            return;
+          }
+          await runAutoExtraction(event.sessionID, config, {
+            service,
+            generate,
+            readPrompt: readExtractionPrompt,
+            getMessages,
+          });
+        } catch (error) {
+          log("auto extraction: unexpected", { error: errorMessage(error) });
+        } finally {
+          running.delete(event.sessionID);
+        }
+      })();
     });
 
     const controller = new AbortController();
@@ -104,10 +125,19 @@ const OpenCodeCortexPlugin: Plugin = {
           const location = (event as { location?: { directory?: string } }).location?.directory;
           if (location && location !== ctx.location.directory) continue;
           if (event.type === "session.compaction.ended") {
+            log("memory context: compaction event received", {
+              session_id: event.data.sessionID,
+              reason: event.data.reason,
+            });
             injectionCache.clear(event.data.sessionID);
+            pendingReinject.add(event.data.sessionID);
+            log("memory context: cache cleared", { session_id: event.data.sessionID });
           } else if (event.type === "session.deleted") {
             const sessionID = (event.data as { sessionID?: string }).sessionID;
-            if (sessionID) injectionCache.clear(sessionID);
+            if (sessionID) {
+              injectionCache.clear(sessionID);
+              pendingReinject.delete(sessionID);
+            }
           }
         }
       } catch (error) {
@@ -120,6 +150,7 @@ const OpenCodeCortexPlugin: Plugin = {
     return async () => {
       controller.abort();
       injectionCache.clearAll();
+      pendingReinject.clear();
       await watcher;
       await service.close();
     };

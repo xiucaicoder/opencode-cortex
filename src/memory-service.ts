@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type { CortexConfig } from "./config.js";
 import type { ProjectInfo } from "./project.js";
 import type { Embedder } from "./embedding.js";
@@ -20,6 +20,7 @@ export interface MemoryHit {
   category: MemoryCategory;
   content: string;
   related_files: string[];
+  source: MemorySource;
   updated_at: number;
   version: number;
 }
@@ -143,6 +144,7 @@ function toHit(record: MemoryRecord): MemoryHit {
     category: record.category,
     content: record.content,
     related_files: record.related_files,
+    source: record.source,
     updated_at: record.updated_at,
     version: record.version,
   };
@@ -206,15 +208,7 @@ export class MemoryService {
     const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit || 5)));
     const vector = await this.embed(`${query.trim()}`);
     const hits = await this.store.search(query.trim(), vector, safeLimit);
-    return hits.map((hit) => ({
-      id: hit.id,
-      title: hit.title,
-      category: hit.category,
-      content: hit.content,
-      related_files: hit.related_files,
-      updated_at: hit.updated_at,
-      version: hit.version,
-    }));
+    return hits.map(toHit);
   }
 
   async mutate(input: MutateInput, actor: Actor = "tool"): Promise<MutateResult> {
@@ -260,6 +254,9 @@ export class MemoryService {
   async getSessionState(sessionID: string): Promise<{
     last_extracted_message_id: string | null;
     last_extracted_at: number | null;
+    attempt_target_id: string | null;
+    failed_attempts: number;
+    failed_at: number | null;
   }> {
     await this.ready();
     return this.store.getSessionState(sessionID);
@@ -268,6 +265,15 @@ export class MemoryService {
   async setSessionState(sessionID: string, messageID: string, at: number): Promise<void> {
     await this.ready();
     await this.store.setSessionState(sessionID, messageID, at);
+  }
+
+  async recordExtractionFailure(
+    sessionID: string,
+    targetMessageID: string,
+    at: number
+  ): Promise<number> {
+    await this.ready();
+    return this.store.recordExtractionFailure(sessionID, targetMessageID, at);
   }
 
   /** Auto extraction may add or update (never delete); version is resolved internally. */
@@ -385,6 +391,17 @@ export class MemoryService {
     return { id, action: "inserted", version: 1 };
   }
 
+  /** 8-hex-char id; lengthen only if the tiny namespace keeps colliding. */
+  private async newMemoryId(): Promise<string> {
+    for (const bytes of [4, 5, 6]) {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const id = randomBytes(bytes).toString("hex");
+        if (!(await this.store.getById(id))) return id;
+      }
+    }
+    throw new MemoryError("id_collision", "无法生成唯一的记忆 id，请重试");
+  }
+
   private async add(input: MutateInput, actor: Actor): Promise<MutateResult> {
     const title = requiredString(input.title, "title");
     const category = normalizeCategory(input.category);
@@ -420,7 +437,7 @@ export class MemoryService {
     }
     const now = Date.now();
     const record: MemoryRecord = {
-      id: randomUUID(),
+      id: await this.newMemoryId(),
       title,
       category,
       content,

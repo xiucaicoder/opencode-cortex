@@ -1,7 +1,9 @@
 import { connect, type Database } from "@tursodatabase/database";
 import type { EncryptionOpts } from "@tursodatabase/database-common";
+import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { log } from "./logger.js";
 
 export const CATEGORIES = [
   "domain_rule",
@@ -196,7 +198,10 @@ export class MemoryStore {
         CREATE TABLE IF NOT EXISTS session_state (
           session_id TEXT PRIMARY KEY,
           last_extracted_message_id TEXT,
-          last_extracted_at INTEGER
+          last_extracted_at INTEGER,
+          attempt_target_id TEXT,
+          failed_attempts INTEGER NOT NULL DEFAULT 0,
+          failed_at INTEGER
         );
       `);
       await db.batch(
@@ -267,13 +272,65 @@ export class MemoryStore {
         `Embedding pooling 不匹配：库为 ${pooling ?? "未知"}，当前为 ${this.options.pooling}。请恢复原 pooling 或重建库。`
       );
     }
+    const shortened = await this.shortenLegacyUuidIds(db);
+    if (shortened > 0) log("memory ids shortened", { count: shortened });
     await db.exec(`
       CREATE TABLE IF NOT EXISTS session_state (
         session_id TEXT PRIMARY KEY,
         last_extracted_message_id TEXT,
-        last_extracted_at INTEGER
+        last_extracted_at INTEGER,
+        attempt_target_id TEXT,
+        failed_attempts INTEGER NOT NULL DEFAULT 0,
+        failed_at INTEGER
       )
     `);
+    await this.ensureSessionStateColumns(db);
+  }
+
+  /** Stage 2 generated UUIDs; shorten them once while keeping ids unique. */
+  private async shortenLegacyUuidIds(db: Database): Promise<number> {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const rows = (await db.all("SELECT id FROM memories")) as Array<{ id?: string }>;
+    const used = new Set(rows.map((row) => String(row.id)));
+    const legacy = [...used].filter((id) => uuid.test(id));
+    let changed = 0;
+    for (const oldId of legacy) {
+      let candidate: string | null = null;
+      for (const bytes of [4, 5, 6]) {
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const value = randomBytes(bytes).toString("hex");
+          if (!used.has(value)) {
+            candidate = value;
+            break;
+          }
+        }
+        if (candidate) break;
+      }
+      if (!candidate) throw new Error(`无法为旧记忆 ${oldId} 生成唯一短 id`);
+      await db.run("UPDATE memories SET id = ? WHERE id = ?", candidate, oldId);
+      used.delete(oldId);
+      used.add(candidate);
+      changed++;
+    }
+    return changed;
+  }
+
+  /** Stage 2 shipped a three-column table; add attempt tracking in place. */
+  private async ensureSessionStateColumns(db: Database): Promise<void> {
+    const rows = (await db.all("PRAGMA table_info(session_state)")) as Array<{
+      name?: string;
+    }>;
+    const existing = new Set(rows.map((row) => String(row.name)));
+    const columns: Array<[string, string]> = [
+      ["attempt_target_id", "TEXT"],
+      ["failed_attempts", "INTEGER NOT NULL DEFAULT 0"],
+      ["failed_at", "INTEGER"],
+    ];
+    for (const [name, definition] of columns) {
+      if (!existing.has(name)) {
+        await db.exec(`ALTER TABLE session_state ADD COLUMN ${name} ${definition}`);
+      }
+    }
   }
 
   private async getMetaWith(db: Database, key: string): Promise<string | null> {
@@ -305,30 +362,79 @@ export class MemoryStore {
   async getSessionState(sessionID: string): Promise<{
     last_extracted_message_id: string | null;
     last_extracted_at: number | null;
+    attempt_target_id: string | null;
+    failed_attempts: number;
+    failed_at: number | null;
   }> {
     const db = await this.connection();
     const row = (await db.get(
-      "SELECT last_extracted_message_id, last_extracted_at FROM session_state WHERE session_id = ?",
+      `SELECT last_extracted_message_id, last_extracted_at, attempt_target_id,
+              failed_attempts, failed_at
+       FROM session_state WHERE session_id = ?`,
       sessionID
-    )) as { last_extracted_message_id?: string; last_extracted_at?: number } | null;
+    )) as {
+      last_extracted_message_id?: string;
+      last_extracted_at?: number;
+      attempt_target_id?: string;
+      failed_attempts?: number;
+      failed_at?: number;
+    } | null;
     return {
       last_extracted_message_id: row?.last_extracted_message_id ?? null,
       last_extracted_at: row?.last_extracted_at ?? null,
+      attempt_target_id: row?.attempt_target_id ?? null,
+      failed_attempts: row?.failed_attempts ?? 0,
+      failed_at: row?.failed_at ?? null,
     };
   }
 
+  /** Advance the watermark and clear all retry bookkeeping. */
   async setSessionState(sessionID: string, messageID: string, at: number): Promise<void> {
     const db = await this.connection();
     await db.run(
-      `INSERT INTO session_state (session_id, last_extracted_message_id, last_extracted_at)
-       VALUES (?, ?, ?)
+      `INSERT INTO session_state (
+         session_id, last_extracted_message_id, last_extracted_at,
+         attempt_target_id, failed_attempts, failed_at
+       ) VALUES (?, ?, ?, NULL, 0, NULL)
        ON CONFLICT(session_id) DO UPDATE SET
          last_extracted_message_id = excluded.last_extracted_message_id,
-         last_extracted_at = excluded.last_extracted_at`,
+         last_extracted_at = excluded.last_extracted_at,
+         attempt_target_id = NULL,
+         failed_attempts = 0,
+         failed_at = NULL`,
       sessionID,
       messageID,
       at
     );
+  }
+
+  /**
+   * Record a transient failure without moving the watermark. Attempts reset
+   * when the target message changes, so the cap applies to one increment only.
+   */
+  async recordExtractionFailure(
+    sessionID: string,
+    targetMessageID: string,
+    at: number
+  ): Promise<number> {
+    const state = await this.getSessionState(sessionID);
+    const attempts =
+      state.attempt_target_id === targetMessageID ? state.failed_attempts + 1 : 1;
+    const db = await this.connection();
+    await db.run(
+      `INSERT INTO session_state (
+         session_id, attempt_target_id, failed_attempts, failed_at
+       ) VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         attempt_target_id = excluded.attempt_target_id,
+         failed_attempts = excluded.failed_attempts,
+         failed_at = excluded.failed_at`,
+      sessionID,
+      targetMessageID,
+      attempts,
+      at
+    );
+    return attempts;
   }
 
   async getOverview(): Promise<string> {

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { runAutoExtraction, parseExtractionItems, type RawSessionMessage } from "../src/extraction.js";
 import { createTestRuntime } from "./helpers.js";
 
@@ -186,26 +188,128 @@ describe("auto extraction", () => {
     }
   });
 
-  it("advances the watermark on generate failure and never retries", async () => {
+  it("keeps the watermark on transient failure and applies failure cooldown", async () => {
     const runtime = createTestRuntime();
     try {
       const config = {
         ...runtime.config,
-        autoExtract: { ...runtime.config.autoExtract, minInputChars: 10, cooldownMinutes: 0 },
+        autoExtract: {
+          ...runtime.config.autoExtract,
+          minInputChars: 10,
+          cooldownMinutes: 0,
+          failureCooldownMinutes: 30,
+        },
       };
       let calls = 0;
       const first = await runAutoExtraction("s1", config, {
         service: runtime.service,
         generate: async () => {
           calls++;
-          throw new Error("provider unavailable");
+          throw new Error("request timed out");
+        },
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+        now: () => 1_000_000,
+      });
+      expect(first.status).toBe("failed");
+      expect(first.reason).toBe("generate");
+      expect(first.attempts).toBe(1);
+      expect(calls).toBe(1);
+      expect((await runtime.service.getSessionState("s1")).last_extracted_message_id).toBeNull();
+
+      const second = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: async () => {
+          calls++;
+          return "[]";
+        },
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+        now: () => 1_060_000,
+      });
+      expect(second.status).toBe("skipped");
+      expect(second.reason).toBe("failure_cooldown");
+      expect(calls).toBe(1);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("advances the watermark after two transient attempts", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const config = {
+        ...runtime.config,
+        autoExtract: {
+          ...runtime.config.autoExtract,
+          minInputChars: 10,
+          cooldownMinutes: 0,
+          failureCooldownMinutes: 0,
+        },
+      };
+      let calls = 0;
+      const failing = async (): Promise<string> => {
+        calls++;
+        throw new Error("429 rate limit exceeded");
+      };
+      const first = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: failing,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+        now: () => 1_000_000,
+      });
+      expect(first.attempts).toBe(1);
+      expect((await runtime.service.getSessionState("s1")).last_extracted_message_id).toBeNull();
+
+      const second = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: failing,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+        now: () => 1_000_001,
+      });
+      expect(second.attempts).toBe(2);
+      expect((await runtime.service.getSessionState("s1")).last_extracted_message_id).toBe("m2");
+
+      const third = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: failing,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+        now: () => 1_000_002,
+      });
+      expect(third.reason).toBe("no_increment");
+      expect(calls).toBe(2);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("advances the watermark after a non-retryable parse failure", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const config = {
+        ...runtime.config,
+        autoExtract: {
+          ...runtime.config.autoExtract,
+          minInputChars: 10,
+          cooldownMinutes: 0,
+          failureCooldownMinutes: 30,
+        },
+      };
+      let calls = 0;
+      const first = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: async () => {
+          calls++;
+          return "not json";
         },
         readPrompt: () => "PROMPT",
         getMessages: async () => messages,
       });
       expect(first.status).toBe("failed");
-      expect(first.reason).toBe("generate");
-      expect(calls).toBe(1);
+      expect(first.reason).toBe("parse");
       expect((await runtime.service.getSessionState("s1")).last_extracted_message_id).toBe("m2");
 
       const second = await runAutoExtraction("s1", config, {
@@ -217,9 +321,83 @@ describe("auto extraction", () => {
         readPrompt: () => "PROMPT",
         getMessages: async () => messages,
       });
-      expect(second.status).toBe("skipped");
       expect(second.reason).toBe("no_increment");
       expect(calls).toBe(1);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("redacts conversation secrets before sending the prompt", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const secret = "AKIAIOSFODNN7EXAMPLE";
+      let prompt = "";
+      const config = {
+        ...runtime.config,
+        autoExtract: { ...runtime.config.autoExtract, minInputChars: 1 },
+      };
+      const outcome = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: async (value) => {
+          prompt = value;
+          return "[]";
+        },
+        readPrompt: () => "PROMPT",
+        getMessages: async () => [
+          {
+            id: "m1",
+            type: "user",
+            text: `我们确认退款规则时会用到密钥 ${secret}，这条不要记进去。`,
+            time: { created: 1 },
+          },
+        ],
+      });
+      expect(outcome.status).toBe("ok");
+      expect(prompt).toContain("[REDACTED]");
+      expect(prompt).not.toContain(secret);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("captures dry-run candidates without writing memories", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const config = {
+        ...runtime.config,
+        autoCaptureDryRun: true,
+        autoExtract: {
+          ...runtime.config.autoExtract,
+          minInputChars: 10,
+          cooldownMinutes: 0,
+        },
+      };
+      const output = JSON.stringify([
+        {
+          action: "add",
+          title: "退款审核",
+          category: "domain_rule",
+          content: "退款超过 500 元必须财务审核",
+          related_files: ["src/refund.ts"],
+        },
+      ]);
+      const outcome = await runAutoExtraction("dry-session", config, {
+        service: runtime.service,
+        generate: async () => output,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+      });
+      expect(outcome.status).toBe("ok");
+      expect(outcome.dryRun).toBe(true);
+      expect(outcome.captured).toBe(1);
+      expect(await runtime.service.listActive()).toHaveLength(0);
+
+      const file = join(runtime.config.storagePath, "dry-run.jsonl");
+      const line = JSON.parse(readFileSync(file, "utf-8").trim()) as Record<string, unknown>;
+      expect(line.session_id).toBe("dry-session");
+      expect(line.title).toBe("退款审核");
+      expect(typeof line.time).toBe("string");
     } finally {
       await runtime.cleanup();
     }

@@ -35,6 +35,8 @@ export interface CortexConfig {
   dedupRelatedLimit: number;
   /** Extra regular expressions rejected in title/content/related_files/source_ref. */
   blockedPatterns: string[];
+  /** Capture extraction output to dry-run.jsonl instead of writing memories. */
+  autoCaptureDryRun: boolean;
   /** Provider id used by automatic extraction. */
   opencodeProvider: string;
   /** Model ref used by automatic extraction; "inherit" follows the host default. */
@@ -51,8 +53,10 @@ export interface CortexConfig {
     minNewMessages: number;
     /** Minimum combined characters of new user messages + final reply. */
     minInputChars: number;
-    /** Per-session cooldown after a successful or failed extraction attempt. */
+    /** Per-session cooldown after a successful extraction attempt. */
     cooldownMinutes: number;
+    /** Per-session cooldown after a transient failure. */
+    failureCooldownMinutes: number;
     maxInputChars: number;
     maxAssistantChars: number;
     maxMessages: number;
@@ -72,6 +76,7 @@ const DEFAULTS: CortexConfig = {
   dedupRelatedThreshold: 0.75,
   dedupRelatedLimit: 3,
   blockedPatterns: [],
+  autoCaptureDryRun: false,
   opencodeProvider: "opencode-go",
   opencodeModel: "opencode-go/glm-5.3-flash",
   opencodeVariant: "low",
@@ -82,6 +87,7 @@ const DEFAULTS: CortexConfig = {
     minNewMessages: 1,
     minInputChars: 80,
     cooldownMinutes: 10,
+    failureCooldownMinutes: 30,
     maxInputChars: 12000,
     maxAssistantChars: 4000,
     maxMessages: 40,
@@ -219,6 +225,7 @@ export function loadConfig(directory: string): CortexConfig {
           return value;
         })
       : [],
+    autoCaptureDryRun: booleanField(raw, "autoCaptureDryRun", DEFAULTS.autoCaptureDryRun),
     opencodeProvider: stringField(raw, "opencodeProvider", DEFAULTS.opencodeProvider),
     opencodeModel: stringField(raw, "opencodeModel", DEFAULTS.opencodeModel),
     ...(typeof raw.opencodeVariant === "string" && raw.opencodeVariant.trim()
@@ -240,6 +247,11 @@ export function loadConfig(directory: string): CortexConfig {
         autoRaw,
         "cooldownMinutes",
         DEFAULTS.autoExtract.cooldownMinutes
+      ),
+      failureCooldownMinutes: numberField(
+        autoRaw,
+        "failureCooldownMinutes",
+        DEFAULTS.autoExtract.failureCooldownMinutes
       ),
       maxInputChars: numberField(autoRaw, "maxInputChars", DEFAULTS.autoExtract.maxInputChars),
       maxAssistantChars: numberField(
@@ -277,6 +289,11 @@ export function loadConfig(directory: string): CortexConfig {
   positiveInteger(config.autoExtract.minNewMessages, "autoExtract.minNewMessages");
   positiveInteger(config.autoExtract.minInputChars, "autoExtract.minInputChars", true);
   positiveInteger(config.autoExtract.cooldownMinutes, "autoExtract.cooldownMinutes", true);
+  positiveInteger(
+    config.autoExtract.failureCooldownMinutes,
+    "autoExtract.failureCooldownMinutes",
+    true
+  );
   positiveInteger(config.autoExtract.maxInputChars, "autoExtract.maxInputChars");
   positiveInteger(config.autoExtract.maxAssistantChars, "autoExtract.maxAssistantChars");
   positiveInteger(config.autoExtract.maxMessages, "autoExtract.maxMessages");

@@ -17,7 +17,11 @@
   "dedupRelatedLimit": 3,
 
   // 额外敏感信息正则，命中 title/content/related_files/source_ref 即拒绝写入
+  // 自动提取发送给模型前也会用同一组规则把命中片段替换为 [REDACTED]
   "blockedPatterns": [],
+
+  // 开启后自动提取只写 <storagePath>/dry-run.jsonl，不写记忆库
+  "autoCaptureDryRun": false,
 
   // 可选数据库加密；启用后未配置 key 时自动生成到 <storagePath>/db.key
   "databaseEncryptionEnabled": false,
@@ -42,8 +46,11 @@
     "minNewMessages": 1,
     // 增量文本少于该字符数则跳过
     "minInputChars": 80,
-    // 同一会话两次提取的最小间隔（分钟），0 表示不限制
+    // 同一会话两次成功提取的最小间隔（分钟），0 表示不限制
     "cooldownMinutes": 10,
+    // 瞬时失败（超时/限流/网络）后的冷却时间（分钟）
+    // 同一增量最多尝试 2 次，之后推进水位
+    "failureCooldownMinutes": 30,
     "maxInputChars": 12000,
     "maxAssistantChars": 4000,
     "maxMessages": 40,

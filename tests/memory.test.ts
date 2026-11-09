@@ -13,6 +13,54 @@ async function catchError(promise: Promise<unknown>): Promise<MemoryError> {
 }
 
 describe("memory_mutate validation", () => {
+  it("generates 8-character hex ids for new memories", async () => {
+    const runtime = createTestRuntime();
+    try {
+      runtime.embedder.set("短 id 规则\n新写入使用短 id", 0);
+      runtime.embedder.set("短 id 规则二\n另一条不同事实", Math.acos(0.5));
+      const first = await runtime.service.mutate({
+        action: "add",
+        title: "短 id 规则",
+        category: "domain_rule",
+        content: "新写入使用短 id",
+      });
+      const second = await runtime.service.mutate({
+        action: "add",
+        title: "短 id 规则二",
+        category: "domain_rule",
+        content: "另一条不同事实",
+      });
+      expect(first.id).toMatch(/^[0-9a-f]{8}$/);
+      expect(second.id).toMatch(/^[0-9a-f]{8}$/);
+      expect(second.id).not.toBe(first.id);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("shortens legacy UUID ids when opening a stage 2 database", async () => {
+    const runtime = createTestRuntime();
+    let second: Awaited<ReturnType<typeof createSecondService>> | undefined;
+    try {
+      const uuid = "123e4567-e89b-12d3-a456-426614174000";
+      await runtime.service.importRecord({
+        id: uuid,
+        title: "旧 id 条目",
+        category: "domain_rule",
+        content: "阶段 2 生成的 UUID",
+      });
+      await runtime.service.close();
+      second = await createSecondService(runtime.config, runtime.dbPath);
+      const rows = await second.service.listActive();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.id).toMatch(/^[0-9a-f]{8}$/);
+      expect(rows[0]?.id).not.toBe(uuid);
+    } finally {
+      await second?.service.close();
+      await runtime.cleanup();
+    }
+  });
+
   it("rejects content longer than 200 characters", async () => {
     const runtime = createTestRuntime();
     try {

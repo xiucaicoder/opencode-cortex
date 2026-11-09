@@ -1,7 +1,13 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { CortexConfig } from "./config.js";
 import type { MemoryHit, MemoryService } from "./memory-service.js";
 import { MemoryError } from "./memory-service.js";
 import { log } from "./logger.js";
+import { redactSecrets } from "./secrets.js";
+
+/** One increment is attempted at most twice before the watermark moves on. */
+export const MAX_EXTRACTION_ATTEMPTS = 2;
 
 export interface RawSessionMessage {
   id: string;
@@ -42,6 +48,9 @@ export type ExtractionOutcome = {
   added?: number;
   updated?: number;
   skippedItems?: number;
+  attempts?: number;
+  dryRun?: boolean;
+  captured?: number;
 };
 
 export function toExtractMessages(messages: RawSessionMessage[]): ExtractMessage[] {
@@ -98,14 +107,15 @@ export function selectIncrement(
 
 export function buildIncrement(
   messages: ExtractMessage[],
-  limits: { maxAssistantChars: number; maxInputChars: number }
+  limits: { maxAssistantChars: number; maxInputChars: number },
+  redact: (text: string) => string = (text) => text
 ): Increment | null {
   const users = messages.filter((message) => message.role === "user");
   if (users.length === 0) return null;
 
   const assistants = messages.filter((message) => message.role === "assistant");
-  const finalAssistant = assistants.at(-1)?.text ?? "";
-  const userText = users.map((message) => message.text).join("\n---\n");
+  const finalAssistant = redact(assistants.at(-1)?.text ?? "");
+  const userText = users.map((message) => redact(message.text)).join("\n---\n");
   const assistantText = finalAssistant.slice(0, limits.maxAssistantChars);
   const inputText = (
     assistantText ? `用户:\n${userText}\n\n助手:\n${assistantText}` : `用户:\n${userText}`
@@ -223,9 +233,9 @@ export interface ExtractionDeps {
 }
 
 /**
- * Runs at most one extraction model call per idle. The watermark advances
- * before the call, so a provider failure is logged once and never retried
- * automatically; the host session is never blocked.
+ * Runs at most one extraction model call per idle. A successful call or a
+ * non-retryable failure advances the watermark. Transient failures keep it in
+ * place, use a failure cooldown, and give up after two attempts.
  */
 export async function runAutoExtraction(
   sessionID: string,
@@ -235,6 +245,12 @@ export async function runAutoExtraction(
   const now = deps.now?.() ?? Date.now();
   try {
     const state = await deps.service.getSessionState(sessionID);
+    if (
+      state.failed_at !== null &&
+      now - state.failed_at < config.autoExtract.failureCooldownMinutes * 60_000
+    ) {
+      return { status: "skipped", reason: "failure_cooldown" };
+    }
     if (
       state.last_extracted_at !== null &&
       now - state.last_extracted_at < config.autoExtract.cooldownMinutes * 60_000
@@ -258,7 +274,21 @@ export async function runAutoExtraction(
     );
     if (!incrementMessages) return { status: "skipped", reason: "no_increment" };
 
-    const increment = buildIncrement(incrementMessages, config.autoExtract);
+    // Redact with the same rules used by the write path before any truncation,
+    // so a secret split by a slice boundary cannot leak. Only counts and rule
+    // names may be logged.
+    let redactionHits = 0;
+    const redactionRules = new Set<string>();
+    const increment = buildIncrement(
+      incrementMessages,
+      config.autoExtract,
+      (text) => {
+        const result = redactSecrets(text, config.blockedPatterns);
+        redactionHits += result.hits;
+        for (const rule of result.rules) redactionRules.add(rule);
+        return result.text;
+      }
+    );
     if (!increment) return { status: "skipped", reason: "no_user_text" };
     if (
       increment.userCount < config.autoExtract.minNewMessages ||
@@ -266,13 +296,40 @@ export async function runAutoExtraction(
     ) {
       return { status: "skipped", reason: "too_short" };
     }
+    if (redactionHits > 0) {
+      log("auto extraction: input redacted", {
+        hits: redactionHits,
+        rules: [...redactionRules],
+      });
+    }
+
+    const failTransient = async (reason: string): Promise<ExtractionOutcome> => {
+      const attempts = await deps.service.recordExtractionFailure(
+        sessionID,
+        increment.nextLastId,
+        now
+      );
+      log("auto extraction: transient failure", {
+        reason,
+        attempts,
+        max_attempts: MAX_EXTRACTION_ATTEMPTS,
+      });
+      if (attempts >= MAX_EXTRACTION_ATTEMPTS) {
+        await deps.service.setSessionState(sessionID, increment.nextLastId, now);
+        log("auto extraction: attempt limit reached, watermark advanced", {
+          reason,
+          attempts,
+        });
+      }
+      return { status: "failed", reason, attempts };
+    };
 
     let oldMemories: MemoryHit[];
     try {
       oldMemories = await deps.service.search(increment.queryText, 3);
     } catch (error) {
       log("auto extraction: retrieval failed", { error: errorMessage(error) });
-      return { status: "failed", reason: "retrieval" };
+      return failTransient("retrieval");
     }
 
     let basePrompt: string;
@@ -280,19 +337,25 @@ export async function runAutoExtraction(
       basePrompt = deps.readPrompt();
     } catch (error) {
       log("auto extraction: prompt missing", { error: errorMessage(error) });
+      await deps.service.setSessionState(sessionID, increment.nextLastId, now);
       return { status: "failed", reason: "prompt" };
     }
 
-    // No automatic retry: the increment is consumed before the model call.
-    await deps.service.setSessionState(sessionID, increment.nextLastId, now);
-
     let output: string;
     try {
-      output = await deps.generate(buildExtractionPrompt(basePrompt, oldMemories, increment.inputText));
+      output = await deps.generate(
+        buildExtractionPrompt(basePrompt, oldMemories, increment.inputText)
+      );
     } catch (error) {
       log("auto extraction: generate failed", { error: errorMessage(error) });
+      if (isTransientFailure(error)) return failTransient("generate");
+      await deps.service.setSessionState(sessionID, increment.nextLastId, now);
+      log("auto extraction: non-retryable generate error, watermark advanced", {});
       return { status: "failed", reason: "generate" };
     }
+
+    // The model answered: consume the increment even if its JSON is invalid.
+    await deps.service.setSessionState(sessionID, increment.nextLastId, now);
 
     let parsed: { items: ExtractItem[]; skipped: number };
     try {
@@ -300,6 +363,22 @@ export async function runAutoExtraction(
     } catch (error) {
       log("auto extraction: invalid output", { error: errorMessage(error) });
       return { status: "failed", reason: "parse" };
+    }
+
+    if (config.autoCaptureDryRun) {
+      const captured = appendDryRun(config, sessionID, parsed.items, now);
+      log("auto extraction: dry run captured", {
+        captured,
+        skipped: parsed.skipped,
+      });
+      return {
+        status: "ok",
+        added: 0,
+        updated: 0,
+        skippedItems: parsed.skipped,
+        dryRun: true,
+        captured,
+      };
     }
 
     let added = 0;
@@ -325,6 +404,47 @@ export async function runAutoExtraction(
     log("auto extraction: failed", { error: errorMessage(error) });
     return { status: "failed", reason: "unexpected" };
   }
+}
+
+function isTransientFailure(error: unknown): boolean {
+  const name =
+    error && typeof error === "object" && "name" in error ? String(error.name) : "";
+  if (name === "AbortError" || name === "TimeoutError") return true;
+  const message = errorMessage(error).toLowerCase();
+  return /timeout|timed out|aborted|rate.?limit|too many requests|429|econnreset|econnrefused|enotfound|eai_again|network|fetch failed|socket hang up|connection (?:reset|closed|refused)|temporar|overloaded|unavailable|\b50[0234]\b/.test(
+    message
+  );
+}
+
+/** Append redacted extraction candidates without touching the database. */
+function appendDryRun(
+  config: CortexConfig,
+  sessionID: string,
+  items: ExtractItem[],
+  now: number
+): number {
+  const path = join(config.storagePath, "dry-run.jsonl");
+  mkdirSync(dirname(path), { recursive: true });
+  const time = new Date(now).toISOString();
+  const lines = items.map((item) => {
+    const title = redactSecrets(item.title, config.blockedPatterns).text;
+    const content = redactSecrets(item.content, config.blockedPatterns).text;
+    const relatedFiles = item.related_files.map(
+      (file) => redactSecrets(file, config.blockedPatterns).text
+    );
+    return JSON.stringify({
+      time,
+      session_id: sessionID,
+      action: item.action,
+      ...(item.id ? { id: item.id } : {}),
+      title,
+      category: item.category,
+      content,
+      related_files: relatedFiles,
+    });
+  });
+  if (lines.length > 0) appendFileSync(path, `${lines.join("\n")}\n`, "utf-8");
+  return lines.length;
 }
 
 function errorMessage(error: unknown): string {
