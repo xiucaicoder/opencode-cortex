@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://opencode-mem.zhafron.my.id/sitemap-index.xml
