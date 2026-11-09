@@ -1,5 +1,7 @@
 # opencode-cortex
 
+[English](./README.en.md) | 简体中文
+
 项目级「业务知识与架构记忆」插件。只沉淀四类内容，让新接手的开发者或新会话中的 AI 不翻历史对话就能知道项目为什么这样做。
 
 - `domain_rule`：业务规则
