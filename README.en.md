@@ -40,16 +40,18 @@ Searches `active` entries only and returns:
 ]
 ```
 
-### `memory_mutate(action, id?, version?, title, category, content, related_files?, source_ref?)`
+Results with a source reference also include `source_ref`.
+
+### `memory_mutate(action, evidence_quote, id?, version?, title?, category?, content?, related_files?)`
 
 - `content` is limited to 200 Unicode code points.
 - New entries use an eight-character hexadecimal `id`; collisions are retried with longer IDs. When an older stage 2 database is opened, existing UUIDs are shortened in place, with collision retries and a migration count logged.
 - `update` and `delete` require `id` and `version`. A version conflict is rejected and requires a fresh search.
 - Before `add`, the plugin searches for similar entries:
-  - At or above `dedupRejectThreshold` (default `0.92`), the add is rejected and the existing entry ID is returned for a possible `update`.
+  - At or above `dedupRejectThreshold` (default `0.92`), the plugin checks whether the rules are equivalent, apply to distinct scopes, or may conflict.
   - After a successful write, up to `dedupRelatedLimit` (default `3`) closest active entries at or above `dedupRelatedThreshold` (default `0.75`) are returned with `id`, `title`, `content`, and `similarity`, allowing the host AI to decide whether to merge them.
 - Writes are rejected when the title, content, `related_files`, or `source_ref` matches a built-in or configured sensitive-information rule.
-- An entry with `source_ref` is marked `import`; otherwise it is `manual`. Automatically extracted entries are marked `auto`.
+- Tool writes require a quote from the current developer message and pass a separate evidence review. The plugin records the session reference. Tool writes, imports, and automatic extraction use `manual`, `import`, and `auto` respectively.
 - `delete` archives the entry.
 
 Tool responses include:
@@ -76,14 +78,16 @@ The plugin injects historical memory into the system prompt with a fixed Chinese
 
 When a session becomes idle, the plugin reads new conversation content and attempts to extract the four memory categories:
 
-- Each session records `last_extracted_message_id` in `session_state` and processes only subsequent messages.
+- Each session processes messages in order in bounded batches. Oversized messages resume from the saved offset.
 - Child sessions with a non-empty `parentID` are skipped.
-- If there are too few new messages or characters (`minNewMessages` / `minInputChars`), or a cooldown is active (`cooldownMinutes` / `failureCooldownMinutes`), no model call is made.
-- Each idle event makes at most one model call, using `opencodeModel` (default `opencode-go/glm-5.3-flash`) and `opencodeVariant` (default `low`). No extra model call is made for a summary.
+- A new increment below `minNewMessages` or `minInputChars` is deferred. Pending messages from a previous batch continue on later idle events without waiting for the minimum length or success cooldown.
+- Each idle event makes one extraction call and, when candidates exist, one batched evidence review using `opencodeModel` (default `opencode-go/glm-5.3-flash`) and `opencodeVariant` (default `low`).
 - Before sending, conversation text is redacted using the same rules as write interception; matches become `[REDACTED]`. Logs record only counts and rule names.
-- The watermark advances after a successful model response or a non-retryable error such as invalid JSON or failed validation. Timeouts, rate limits, and network failures retain the watermark and enter a failure cooldown. The same increment is tried at most twice, then the watermark advances and the event is logged.
+- The extraction model must quote a developer message in the current batch. The plugin checks the exact quote, then reviews whether the statement supports the proposed rule. It stores the session and message reference and evidence time.
+- Accepted memories and processing progress commit together. Generation, parsing, review, and storage failures keep the checkpoint in place and can be retried at the next idle event after the failure cooldown.
 - Automatic extraction can only `add` or `update` its own entries; it cannot `delete` or modify `manual` / `import` entries.
-- An automatic add that reaches `dedupRejectThreshold` against a `manual` or `import` entry is discarded.
+- Unresolved candidates are saved separately. Confirmed contradictions hide the affected version from search and the title list. Uncertain relationships alone leave the existing version available. The batch advances and subsequent messages can still be processed. Explicit replacements can update automatic entries. Manual and imported entries require an evidence-backed tool update.
+- Updates and archives retain the previous version and source in the database. History begins with changes made after this feature is enabled. Run `bun run /path/to/opencode-cortex/scripts/export.ts --conflicts` from the project directory to find the affected IDs and versions. An explicit developer statement can resolve the conflict through a versioned `memory_mutate` update.
 - The extraction prompt requires Chinese output, with `category` using the four English enum values.
 - With `autoCaptureDryRun: true`, candidates are appended to `<storagePath>/dry-run.jsonl` (default `~/.opencode-cortex/dry-run.jsonl`) instead of being written as memories. The file contains session IDs, timestamps, actions, and redacted fields. The session watermark still advances to avoid recapturing the same increment.
 
@@ -116,9 +120,9 @@ See [`opencode-cortex.example.jsonc`](./opencode-cortex.example.jsonc) for an ex
 | `autoExtract.minNewMessages` | `1` | Minimum number of new user messages |
 | `autoExtract.minInputChars` | `80` | Minimum length of the increment |
 | `autoExtract.cooldownMinutes` | `10` | Minimum interval between successful extractions in a session; `0` disables the limit |
-| `autoExtract.failureCooldownMinutes` | `30` | Cooldown after a transient failure |
-| `autoExtract.maxInputChars` | `12000` | Maximum number of characters sent to the model |
-| `autoExtract.maxAssistantChars` | `4000` | Maximum characters retained from the last assistant reply |
+| `autoExtract.failureCooldownMinutes` | `30` | Retry cooldown after a batch fails |
+| `autoExtract.maxInputChars` | `12000` | Maximum conversation input characters per batch |
+| `autoExtract.maxAssistantChars` | `4000` | Per-batch character limit for each assistant message |
 | `autoExtract.maxMessages` | `40` | Maximum incremental messages read per extraction |
 | `autoExtract.maxItems` | `10` | Maximum extracted entries accepted per call |
 | `autoExtract.timeoutMs` | `60000` | Model-call timeout |
@@ -167,3 +171,8 @@ bun run scripts/smoke.ts   # real model + Turso + similarity calibration; downlo
 ## License
 
 MIT. This project is a fork of [`tickernelz/opencode-mem`](https://github.com/tickernelz/opencode-mem) and retains the original copyright notice; see [`LICENSE`](./LICENSE).
+
+
+## Commerce session replay
+
+Run `CORTEX_EVAL_URL=http://127.0.0.1:1234/v1 CORTEX_EVAL_MODEL=your-model bun run evaluate` from this repository. The synthetic cases use isolated databases and compare fresh model answers with and without retrieved memories. Set `CORTEX_EVAL_KEY` in the environment if needed. Use `CORTEX_EVAL_JSON_SCHEMA=1` if the endpoint supports JSON Schema.

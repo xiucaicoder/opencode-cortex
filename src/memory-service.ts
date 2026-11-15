@@ -7,12 +7,19 @@ import { findBlockedField } from "./secrets.js";
 import {
   CATEGORIES,
   MemoryStore,
+  type ExtractionCursor,
   type MemoryCategory,
   type MemoryRecord,
   type MemorySource,
+  type SessionState,
 } from "./store.js";
 
 export type Actor = "tool" | "auto" | "import";
+export interface VerifiedMutation extends MutateInput {
+  source_ref: string;
+  evidence_at?: number;
+  comparisons?: Array<{ id: string; version: number; relation: "same" | "distinct" | "conflict" }>;
+}
 
 export interface MemoryHit {
   id: string;
@@ -21,6 +28,7 @@ export interface MemoryHit {
   content: string;
   related_files: string[];
   source: MemorySource;
+  source_ref?: string;
   updated_at: number;
   version: number;
 }
@@ -73,13 +81,15 @@ export interface TitleEntry {
   title: string;
 }
 
-export interface AutoMutation {
+export interface AutoMutation extends VerifiedMutation {
   action: "add" | "update";
   id?: string;
+  version?: number;
   title: string;
   category: string;
   content: string;
   related_files?: string[];
+  source_ref: string;
 }
 
 export class MemoryError extends Error {
@@ -94,6 +104,27 @@ export class MemoryError extends Error {
 }
 
 const MAX_CONTENT_CHARS = 200;
+
+const SKIPPABLE_AUTO_ERRORS = new Set([
+  "archived", "blocked_secret", "stale_evidence", "content_too_long", "duplicate", "duplicate_protected",
+  "invalid_category", "invalid_related_files", "missing_field", "not_found", "protected_source",
+]);
+
+function numericConflict(a: string, b: string): boolean {
+  const numbers = (text: string) => [...new Set(text.match(/\d+(?:\.\d+)?/g) ?? [])].sort().join(",");
+  const left = numbers(a);
+  const right = numbers(b);
+  return !!left && !!right && left !== right;
+}
+
+function isRejectedAutoItem(error: unknown): error is MemoryError {
+  return error instanceof MemoryError && SKIPPABLE_AUTO_ERRORS.has(error.code);
+}
+
+function matchesCursor(state: SessionState, cursor: ExtractionCursor): boolean {
+  return state.last_extracted_message_id === cursor.messageId &&
+    state.last_extracted_offset === cursor.offset;
+}
 
 function charCount(value: string): number {
   return [...value].length;
@@ -145,6 +176,7 @@ function toHit(record: MemoryRecord): MemoryHit {
     content: record.content,
     related_files: record.related_files,
     source: record.source,
+    ...(record.source_ref ? { source_ref: record.source_ref } : {}),
     updated_at: record.updated_at,
     version: record.version,
   };
@@ -200,15 +232,49 @@ export class MemoryService {
     await this.embedder.dispose();
   }
 
-  async search(query: string, limit = 5): Promise<MemoryHit[]> {
+  async search(query: string, limit = 5, includeConflicts = false): Promise<MemoryHit[]> {
     await this.ready();
     if (typeof query !== "string" || !query.trim()) {
       throw new MemoryError("missing_field", "query 不能为空");
     }
     const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit || 5)));
     const vector = await this.embed(`${query.trim()}`);
-    const hits = await this.store.search(query.trim(), vector, safeLimit);
+    const hits = await this.store.search(query.trim(), vector, safeLimit, includeConflicts);
     return hits.map(toHit);
+  }
+
+  async listConflicts(): Promise<unknown[]> {
+    await this.ready();
+    return this.store.listConflicts();
+  }
+
+  async getActive(id: string): Promise<MemoryHit | undefined> {
+    await this.ready();
+    const record = await this.store.getById(id);
+    return record?.status === "active" ? toHit(record) : undefined;
+  }
+
+  async mutateVerified(input: VerifiedMutation): Promise<MutateResult> {
+    await this.ready();
+    this.assertNoSecrets({ title: input.title ?? "", content: input.content ?? "",
+      related_files: normalizeRelatedFiles(input.related_files), source_ref: input.source_ref });
+    const vector = input.action === "delete" ? undefined
+      : await this.embed(`${requiredString(input.title, "title")}
+${requiredString(input.content, "content")}`);
+    const result = await this.store.inTransaction(async (store) => {
+      const service = new MemoryService(this.config, this.project, store, this.embedder);
+      try {
+        if (input.action === "add") return await service.add(input, "tool", vector, input);
+        if (input.action === "update") return await service.update(input, "tool", vector, input);
+        await service.checkEvidenceTime(requiredString(input.id, "id"), input.evidence_at);
+        return await service.archive(input, "tool");
+      } catch (error) {
+        if (!(error instanceof MemoryError) || error.code !== "possible_conflict") throw error;
+        return error;
+      }
+    });
+    if (result instanceof MemoryError) throw result;
+    return result;
   }
 
   async mutate(input: MutateInput, actor: Actor = "tool"): Promise<MutateResult> {
@@ -251,61 +317,88 @@ export class MemoryService {
     return this.store.listActiveTitles(limit);
   }
 
-  async getSessionState(sessionID: string): Promise<{
-    last_extracted_message_id: string | null;
-    last_extracted_at: number | null;
-    attempt_target_id: string | null;
-    failed_attempts: number;
-    failed_at: number | null;
-  }> {
+  async getSessionState(sessionID: string): Promise<SessionState> {
     await this.ready();
     return this.store.getSessionState(sessionID);
   }
 
   async setSessionState(sessionID: string, messageID: string, at: number): Promise<void> {
     await this.ready();
-    await this.store.setSessionState(sessionID, messageID, at);
+    await this.store.setSessionState(sessionID, { messageId: messageID, offset: 0 }, at);
   }
 
   async recordExtractionFailure(
     sessionID: string,
-    targetMessageID: string,
+    cursor: ExtractionCursor,
+    target: ExtractionCursor,
     at: number
-  ): Promise<number> {
+  ): Promise<number | undefined> {
     await this.ready();
-    return this.store.recordExtractionFailure(sessionID, targetMessageID, at);
+    return this.store.inTransaction(async (store) => {
+      if (!matchesCursor(await store.getSessionState(sessionID), cursor)) return;
+      const targetID = target.offset === 0 ? target.messageId! : JSON.stringify(target);
+      return store.recordExtractionFailure(sessionID, targetID, at);
+    });
   }
 
-  /** Auto extraction may add or update (never delete); version is resolved internally. */
-  async autoMutate(input: AutoMutation): Promise<MutateResult> {
+  /** Commit accepted memories and their checkpoint together. */
+  async applyExtractionBatch(
+    sessionID: string,
+    cursor: ExtractionCursor,
+    next: ExtractionCursor,
+    at: number | null,
+    items: AutoMutation[]
+  ): Promise<{ added: number; updated: number; skipped: number; conflicts: number } | null> {
     await this.ready();
-    if (input.action === "update") {
-      const id = requiredString(input.id, "id");
-      const current = await this.store.getById(id);
-      if (!current) throw new MemoryError("not_found", `记忆 ${id} 不存在`, { id });
-      return this.mutate(
-        {
-          action: "update",
-          id,
-          version: current.version,
-          title: input.title,
-          category: input.category,
-          content: input.content,
-          related_files: input.related_files,
-        },
-        "auto"
-      );
+    const result = { added: 0, updated: 0, skipped: 0, conflicts: 0 };
+    const prepared: Array<{ input: AutoMutation; vector: Float32Array }> = [];
+    for (const input of items) {
+      try {
+        const title = requiredString(input.title, "title");
+        const content = requiredString(input.content, "content");
+        normalizeCategory(input.category);
+        assertContentLength(content);
+        this.assertNoSecrets({
+          title,
+          content,
+          related_files: normalizeRelatedFiles(input.related_files),
+          source_ref: requiredString(input.source_ref, "source_ref"),
+        });
+        // The embedder may be slow. Keep it outside the database transaction.
+        const vector = await this.embed(`${title}\n${content}`);
+        prepared.push({ input, vector });
+      } catch (error) {
+        if (!isRejectedAutoItem(error)) throw error;
+        result.skipped++;
+        log("auto extraction: item skipped", { code: error.code, action: input.action });
+      }
     }
-    return this.mutate(
-      {
-        action: "add",
-        title: input.title,
-        category: input.category,
-        content: input.content,
-        related_files: input.related_files,
-      },
-      "auto"
-    );
+
+    return this.store.inTransaction(async (store) => {
+      if (!matchesCursor(await store.getSessionState(sessionID), cursor)) return null;
+      const service = new MemoryService(this.config, this.project, store, this.embedder);
+      for (const { input, vector } of prepared) {
+        try {
+          if (input.action === "add") {
+            await service.add(input, "auto", vector, input);
+            result.added++;
+          } else {
+            await service.update(input, "auto", vector, input);
+            result.updated++;
+          }
+        } catch (error) {
+          if (error instanceof MemoryError && error.code === "possible_conflict") {
+            result.conflicts++;
+            continue;
+          }
+          if (!isRejectedAutoItem(error)) throw error;
+          result.skipped++;
+          log("auto extraction: item skipped", { code: error.code, action: input.action });
+        }
+      }
+      await store.setSessionState(sessionID, next, at);
+      return result;
+    });
   }
 
   /**
@@ -402,7 +495,7 @@ export class MemoryService {
     throw new MemoryError("id_collision", "无法生成唯一的记忆 id，请重试");
   }
 
-  private async add(input: MutateInput, actor: Actor): Promise<MutateResult> {
+  private async add(input: MutateInput, actor: Actor, embedded?: Float32Array, verified?: VerifiedMutation): Promise<MutateResult> {
     const title = requiredString(input.title, "title");
     const category = normalizeCategory(input.category);
     const content = requiredString(input.content, "content");
@@ -412,28 +505,46 @@ export class MemoryService {
     this.assertNoSecrets({ title, content, related_files: relatedFiles, source_ref: sourceRef ?? undefined });
 
     const source: MemorySource =
-      actor === "auto" ? "auto" : actor === "import" ? "import" : sourceRef ? "import" : "manual";
-    const vector = await this.embed(`${title}\n${content}`);
+      actor === "auto" ? "auto" : actor === "import" || (!verified && sourceRef) ? "import" : "manual";
+    const vector = embedded ?? await this.embed(`${title}\n${content}`);
 
     const nearest = await this.store.findNearest(vector, this.config.dedupRelatedLimit);
-    const closest = nearest[0];
-    if (closest) {
-      const similarity = roundSimilarity(closest.similarity);
-      log("memory dedup nearest", { similarity });
-      if (closest.similarity >= this.config.dedupRejectThreshold) {
-        if (actor === "auto" && closest.source !== "auto") {
-          throw new MemoryError(
-            "duplicate_protected",
-            `与已有 ${closest.source} 记忆相似度 ${similarity}，自动提取结果已丢弃`,
-            { id: closest.id, similarity }
-          );
+    const close = nearest.filter((item) => item.similarity >= this.config.dedupRejectThreshold);
+    const duplicate = close.find((existing) => {
+      if (!verified) return !numericConflict(content, existing.content);
+      if (title === existing.title && content === existing.content) return true;
+      return !numericConflict(content, existing.content) &&
+        verified.comparisons?.some(({ id, version, relation }) =>
+          id === existing.id && version === existing.version && relation === "same");
+    });
+    if (duplicate) {
+      const protectedSource = actor === "auto" && duplicate.source !== "auto";
+      throw new MemoryError(protectedSource ? "duplicate_protected" : "duplicate",
+        `已存在等价记忆 ${duplicate.id}`, {
+          id: duplicate.id, similarity: roundSimilarity(duplicate.similarity),
+        });
+    }
+    const uncertain = close.filter((existing) => verified
+      ? !verified.comparisons?.some(({ id, version, relation }) =>
+          id === existing.id && version === existing.version && relation === "distinct")
+      : numericConflict(content, existing.content));
+    if (uncertain.length) {
+      if (verified) {
+        for (const existing of uncertain) {
+          await this.checkEvidenceTime(existing.id, verified.evidence_at);
         }
-        throw new MemoryError(
-          "duplicate",
-          `已存在相似记忆 ${closest.id}（相似度 ${similarity}）。请使用 update 把新事实合并进该条目，而不是新增`,
-          { id: closest.id, similarity }
-        );
+        for (const existing of uncertain) {
+          await this.store.recordConflict(existing.id, existing.version, {
+            title, category, content, source_ref: verified.source_ref,
+            blocksRecall: (title === existing.title && numericConflict(content, existing.content)) ||
+              Boolean(verified.comparisons?.some(({ id, version, relation }) =>
+                id === existing.id && version === existing.version && relation === "conflict")),
+          });
+        }
       }
+      throw new MemoryError("possible_conflict", "发现相似但无法确认可并存的规则，请核对范围及当前版本", {
+        ids: uncertain.map(({ id }) => id),
+      });
     }
     const now = Date.now();
     const record: MemoryRecord = {
@@ -451,20 +562,21 @@ export class MemoryService {
       updated_at: now,
     };
     await this.store.insert(record, vector);
+    await this.store.recordEvidenceTime(record.id, verified?.evidence_at);
 
     const related = nearest
-      .filter((item) => item.similarity >= this.config.dedupRelatedThreshold)
+      .filter((item) => item.available && item.similarity >= this.config.dedupRelatedThreshold)
       .map((item) => ({
         id: item.id,
         title: item.title,
         content: item.content,
         similarity: roundSimilarity(item.similarity),
       }));
-    log("memory added", { id: record.id, category, source, related_count: related.length });
+    if (actor !== "auto") log("memory added", { id: record.id, category, source, related_count: related.length });
     return { success: true, id: record.id, version: 1, related };
   }
 
-  private async update(input: MutateInput, actor: Actor): Promise<MutateResult> {
+  private async update(input: MutateInput, actor: Actor, embedded?: Float32Array, verified?: VerifiedMutation): Promise<MutateResult> {
     const id = requiredString(input.id, "id");
     const expectedVersion = requireVersion(input.version);
     const title = requiredString(input.title, "title");
@@ -478,11 +590,23 @@ export class MemoryService {
       throw new MemoryError("archived", `记忆 ${id} 已归档，不能更新`, { id });
     }
     if (actor === "auto" && current.source !== "auto") {
+      if (verified && current.category === category && content !== current.content) {
+        await this.checkEvidenceTime(id, verified.evidence_at);
+        await this.store.recordConflict(id, current.version, {
+          title, content, category, source_ref: verified.source_ref, blocksRecall: true,
+        });
+        throw new MemoryError("possible_conflict", "现有规则来自人工或导入，已暂缓检索，等待确认", { id });
+      }
       throw new MemoryError(
         "protected_source",
         `记忆 ${id} 来源为 ${current.source}，自动提取不能修改`,
         { id, source: current.source }
       );
+    }
+
+    if (verified) await this.checkEvidenceTime(id, verified.evidence_at);
+    if (actor === "auto" && verified && current.category !== category) {
+      throw new MemoryError("invalid_category", "自动更新不能改变已有规则的分类");
     }
 
     const relatedFiles =
@@ -493,7 +617,7 @@ export class MemoryService {
       input.source_ref === undefined ? current.source_ref : input.source_ref.trim() || null;
     this.assertNoSecrets({ title, content, related_files: relatedFiles, source_ref: sourceRef ?? undefined });
 
-    const vector = await this.embed(`${title}\n${content}`);
+    const vector = embedded ?? await this.embed(`${title}\n${content}`);
     const changes = await this.store.update(
       {
         ...current,
@@ -509,8 +633,16 @@ export class MemoryService {
     );
     if (changes === 0) throw await this.versionConflict(id, expectedVersion);
 
-    log("memory updated", { id, version: expectedVersion + 1, actor });
+    await this.store.recordEvidenceTime(id, verified?.evidence_at);
+    if (actor !== "auto") log("memory updated", { id, version: expectedVersion + 1, actor });
     return { success: true, id, version: expectedVersion + 1 };
+  }
+
+  private async checkEvidenceTime(id: string, at: number | undefined): Promise<void> {
+    const previous = await this.store.getEvidenceTime(id);
+    if (previous !== undefined && (at === undefined || at <= previous)) {
+      throw new MemoryError("stale_evidence", "该证据不能证明这条规则在当前版本之后又有变化", { id });
+    }
   }
 
   private async archive(input: MutateInput, actor: Actor): Promise<MutateResult> {

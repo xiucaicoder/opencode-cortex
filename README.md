@@ -40,16 +40,18 @@
 ]
 ```
 
-### `memory_mutate(action, id?, version?, title, category, content, related_files?, source_ref?)`
+有来源的记忆在搜索结果中还会带上 `source_ref`。
+
+### `memory_mutate(action, evidence_quote, id?, version?, title?, category?, content?, related_files?)`
 
 - `content` 最多 200 字。
 - 新增条目的 `id` 为 8 位十六进制短 id；冲突时自动重试并延长位数。打开阶段 2 旧库时，已有 UUID 会就地缩短为短 id（冲突时重试），并记录迁移条数。
 - `update` / `delete` 必须带 `id` 和 `version`；版本冲突会被拒绝并要求重新检索。
 - `add` 前做相似检索：
-  - 相似度 ≥ `dedupRejectThreshold`（默认 0.92）：拒绝，返回已有条目 id，提示用 `update` 合并进该条目。
+  - 相似度达到 `dedupRejectThreshold`（默认 0.92）时，核验等价、适用范围不同或存疑。等价则去重，范围不同可并存，存疑则隔离。
   - 写入成功时总是返回最近 `dedupRelatedLimit`（默认 3）条相似度 ≥ `dedupRelatedThreshold`（默认 0.75）的 active 条目，含 `id`、`title`、`content`、`similarity`，由宿主 AI 判断是否应合并。
 - 标题、正文、`related_files`、`source_ref` 命中内置或自定义敏感信息规则时拒绝写入。
-- 带 `source_ref` 记为 `import`，否则记为 `manual`；自动提取记为 `auto`。
+- 必须引用当前开发者消息中的原话，通过独立核验后写入。工具生成会话来源并标记 `manual`，导入标记 `import`，自动提取标记 `auto`。
 - `delete` 只归档。
 
 工具错误统一返回：
@@ -78,16 +80,20 @@
 
 会话进入 idle 后，插件按增量读取对话并尝试提炼四类记忆：
 
-- 每个会话在 `session_state` 表记录 `last_extracted_message_id`，只处理此后的新消息。
+- 每个会话按消息顺序分批处理。过长的单条消息从保存的偏移量继续处理。
 - 子会话（`parentID` 非空）直接跳过，不提取子代理的内部对话。
-- 增量不足（`minNewMessages` / `minInputChars`）或处于冷却期（`cooldownMinutes` / `failureCooldownMinutes`）时跳过，不调用模型。
-- 每次 idle 最多一次模型调用，固定使用 `opencodeModel`（默认 `opencode-go/glm-5.3-flash`，`opencodeVariant` 默认 `low`）；不额外调用模型生成摘要。
+- 新增量不足（`minNewMessages` / `minInputChars`）或处于冷却期时跳过。上一批留下的待处理消息在后续空闲事件继续处理，不受最小长度或成功冷却限制。
+- 每次 idle 先提取，有候选才进行独立核验，共用配置的 `opencodeModel` 和 `opencodeVariant`。
 - 发送前用与写入拦截相同的规则对对话文本脱敏，命中片段替换为 `[REDACTED]`；日志只记命中次数和规则名。
-- 模型成功返回或遇到不可重试错误（非法 JSON、校验失败）才推进水位；超时、限流、网络类瞬时失败不推进，进入失败冷却，同一增量最多尝试 2 次，之后推进并记日志。
+- 模型必须为候选记忆引用本批开发者原话。插件核对原话及其语义能否支持候选结论，入库保留会话、消息引用和证据时间。
+- 正式写库与处理进度一起提交。模型调用、解析、核验或写库失败时保留原进度，失败冷却后在下一次空闲事件重试。
 - 自动提取只能 `add` / `update`，不能 `delete`；不能修改 `manual` / `import` 条目。
-- 自动 `add` 与 `manual` / `import` 条目相似度达到 `dedupRejectThreshold` 时直接丢弃。
+- 相似且存疑的候选单独保存。确认存在冲突时，受影响的旧版本暂停检索和注入。仅关系未判定时，原规则继续可查。后续消息照常提取。同范围规则的明确变更可更新自动记忆。手工或导入的规则需通过带证据的 `memory_mutate` 更新。
+- 更新或归档时，数据库保存之前的版本及来源。历史只从启用此功能后的变更开始记录。在项目目录运行 `bun run /path/to/opencode-cortex/scripts/export.ts --conflicts` 获取存疑条目的 id 和版本。开发者明确说明采用的规则后，可带该 id 和版本调用 `memory_mutate` 的 `update`。
 - 输出要求中文，`category` 使用四个英文枚举值。
 - `autoCaptureDryRun: true` 时只把候选项追加到 `<storagePath>/dry-run.jsonl`（默认 `~/.opencode-cortex/dry-run.jsonl`，含会话 id、时间、动作和脱敏后的字段），不写记忆条目，便于先观察提取质量；会话水位仍会推进，避免重复捕获同一增量。
+
+二次核验使用同一配置的模型。上线前可用实际模型运行下方回放，核对业务正确率。
 
 ## 配置
 
@@ -120,9 +126,9 @@
 | `autoExtract.minNewMessages` | `1` | 至少新增用户消息数 |
 | `autoExtract.minInputChars` | `80` | 增量文本最小字符数，不足则跳过 |
 | `autoExtract.cooldownMinutes` | `10` | 同一会话两次成功提取的最小间隔，`0` 表示不限制 |
-| `autoExtract.failureCooldownMinutes` | `30` | 瞬时失败后的冷却时间 |
-| `autoExtract.maxInputChars` | `12000` | 送入模型的最大字符数 |
-| `autoExtract.maxAssistantChars` | `4000` | 保留最后一条助手回复的最大字符数 |
+| `autoExtract.failureCooldownMinutes` | `30` | 批次失败后的重试冷却时间 |
+| `autoExtract.maxInputChars` | `12000` | 每批对话输入的最大字符数 |
+| `autoExtract.maxAssistantChars` | `4000` | 每批中单条助手消息的字符上限 |
 | `autoExtract.maxMessages` | `40` | 单次最多读取的增量消息数 |
 | `autoExtract.maxItems` | `10` | 单次最多接受的提取条目数 |
 | `autoExtract.timeoutMs` | `60000` | 单次模型调用超时 |
@@ -171,3 +177,14 @@ bun run scripts/smoke.ts   # 真实模型 + Turso + 相似度校准，需要下�
 ## 许可
 
 MIT。本项目 fork 自 [`tickernelz/opencode-mem`](https://github.com/tickernelz/opencode-mem)，保留原作者版权声明，详见 [`LICENSE`](./LICENSE)。
+
+
+## 商城跨会话回放
+
+在插件仓库执行，数据全为合成。每例先写入独立临时数据库，重新打开后只向读模型提供检索结果，并和关闭记忆的回答比较。
+
+```sh
+CORTEX_EVAL_URL=http://127.0.0.1:1234/v1 CORTEX_EVAL_MODEL=your-model bun run evaluate
+```
+
+`CORTEX_EVAL_KEY` 可选，由本机环境注入。服务支持 JSON Schema 时可设置 `CORTEX_EVAL_JSON_SCHEMA=1`。命令末尾可追加用例 id，只运行对应场景。输出包含提取结果、过期规则检查、回答正确性和耗时。

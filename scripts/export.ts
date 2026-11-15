@@ -26,11 +26,16 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   let output: string | undefined;
   let includeArchived = false;
+  let conflictsOnly = false;
   let source: MemorySource | undefined;
   let since: number | undefined;
 
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
+    if (arg === "--conflicts") {
+      conflictsOnly = true;
+      continue;
+    }
     if (arg === "--all") {
       includeArchived = true;
       continue;
@@ -54,6 +59,18 @@ async function main(): Promise<void> {
     output = arg;
   }
 
+  if (conflictsOnly) {
+    if (output || includeArchived || source || since !== undefined) {
+      throw new Error("--conflicts 不与导出参数合用");
+    }
+    const { service } = createRuntime(process.cwd());
+    try {
+      console.log(JSON.stringify(await service.listConflicts(), null, 2));
+    } finally {
+      await service.close();
+    }
+    return;
+  }
   if (!output) {
     console.error(
       "用法: bun run scripts/export.ts <output.md> [--all] [--source auto|manual|import] [--since YYYY-MM-DD]"

@@ -1,13 +1,12 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CortexConfig } from "./config.js";
-import type { MemoryHit, MemoryService } from "./memory-service.js";
-import { MemoryError } from "./memory-service.js";
+import type { AutoMutation, MemoryHit, MemoryService } from "./memory-service.js";
+import { compatibleEvidence, sessionSourceRef, type EvidenceReview, type VerifyEvidence } from "./evidence.js";
+import { parseModelArray } from "./model-json.js";
 import { log } from "./logger.js";
 import { redactSecrets } from "./secrets.js";
-
-/** One increment is attempted at most twice before the watermark moves on. */
-export const MAX_EXTRACTION_ATTEMPTS = 2;
+import type { ExtractionCursor } from "./store.js";
 
 export interface RawSessionMessage {
   id: string;
@@ -31,11 +30,14 @@ export interface ExtractItem {
   category: string;
   content: string;
   related_files: string[];
+  evidence_index: number;
+  evidence_quote: string;
 }
 
-export interface Increment {
+interface Increment {
   messages: ExtractMessage[];
-  nextLastId: string;
+  next: ExtractionCursor;
+  hasMore: boolean;
   userCount: number;
   totalChars: number;
   queryText: string;
@@ -48,6 +50,7 @@ export type ExtractionOutcome = {
   added?: number;
   updated?: number;
   skippedItems?: number;
+  conflicts?: number;
   attempts?: number;
   dryRun?: boolean;
   captured?: number;
@@ -89,46 +92,68 @@ export function toExtractMessages(messages: RawSessionMessage[]): ExtractMessage
   return result;
 }
 
-/** Take messages after the stored watermark, or the last N when it is gone. */
-export function selectIncrement(
-  messages: ExtractMessage[],
-  lastMessageID: string | null,
-  maxMessages: number
-): ExtractMessage[] | null {
-  if (messages.length === 0) return null;
-  let start = Math.max(0, messages.length - maxMessages);
-  if (lastMessageID) {
-    const index = messages.findIndex((message) => message.id === lastMessageID);
-    if (index >= 0) start = index + 1;
+function prefixWithinBudget(text: string, chars: number, encode: (value: string) => string): string {
+  if (encode(text).length <= chars) return text;
+  let low = 0;
+  let high = Math.min(text.length, chars);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (encode(text.slice(0, middle)).length <= chars) low = middle;
+    else high = middle - 1;
   }
-  const slice = messages.slice(start);
-  return slice.length > 0 ? slice : null;
+  return text.slice(0, low).replace(/[\uD800-\uDBFF]$/, "");
 }
 
-export function buildIncrement(
+function buildIncrement(
   messages: ExtractMessage[],
-  limits: { maxAssistantChars: number; maxInputChars: number },
-  redact: (text: string) => string = (text) => text
+  cursor: ExtractionCursor,
+  limits: Pick<CortexConfig["autoExtract"], "maxMessages" | "maxAssistantChars" | "maxInputChars">,
+  redact: (text: string) => string
 ): Increment | null {
-  const users = messages.filter((message) => message.role === "user");
-  if (users.length === 0) return null;
+  const previous = messages.findIndex((message) => message.id === cursor.messageId);
+  const start = previous < 0 ? 0 : previous + (cursor.offset === 0 ? 1 : 0);
+  if (start === messages.length) return null;
 
-  const assistants = messages.filter((message) => message.role === "assistant");
-  const finalAssistant = redact(assistants.at(-1)?.text ?? "");
-  const userText = users.map((message) => redact(message.text)).join("\n---\n");
-  const assistantText = finalAssistant.slice(0, limits.maxAssistantChars);
-  const inputText = (
-    assistantText ? `用户:\n${userText}\n\n助手:\n${assistantText}` : `用户:\n${userText}`
-  ).slice(0, limits.maxInputChars);
-  const queryText = `${userText}\n${assistantText}`.trim().slice(0, 2000);
+  const fragments: ExtractMessage[] = [];
+  const lines: string[] = [];
+  let next = cursor;
+  let inputChars = 0;
+  let lastIndex = start;
+  for (let i = start; i < messages.length && fragments.length < limits.maxMessages; i++) {
+    const message = messages[i]!;
+    // Redact the whole message before slicing so a boundary cannot split a credential.
+    const redacted = redact(message.text);
+    const offset = i === previous && cursor.offset < redacted.length ? cursor.offset : 0;
+    const index = fragments.length + 1;
+    const encode = (text: string) => JSON.stringify({ index, role: message.role, text });
+    const budget = limits.maxInputChars - inputChars - (lines.length ? 1 : 0);
+    const remaining = redacted.slice(offset);
+    const available = message.role === "assistant" && remaining.length > limits.maxAssistantChars
+      ? remaining.slice(0, limits.maxAssistantChars).replace(/[\uD800-\uDBFF]$/, "") ||
+        String.fromCodePoint(remaining.codePointAt(0)!)
+      : remaining;
+    // Defer a complete message to the next batch if it fits there.
+    if (fragments.length && (available.length < remaining.length || encode(available).length > budget)) break;
+    const text = prefixWithinBudget(available, budget, encode);
+    if (!text) throw new Error("提取字数上限不足以容纳消息");
+    const line = encode(text);
+    inputChars += line.length + (lines.length ? 1 : 0);
+    lines.push(line);
+    fragments.push({ ...message, text });
+    lastIndex = i;
+    const end = offset + text.length;
+    next = { messageId: message.id, offset: end < redacted.length ? end : 0 };
+    if (next.offset > 0) break;
+  }
 
   return {
-    messages,
-    nextLastId: messages[messages.length - 1]!.id,
-    userCount: users.length,
-    totalChars: inputText.length,
-    queryText,
-    inputText,
+    messages: fragments,
+    next,
+    hasMore: next.offset > 0 || lastIndex < messages.length - 1,
+    userCount: fragments.filter((message) => message.role === "user").length,
+    totalChars: fragments.reduce((count, message) => count + message.text.length, 0),
+    queryText: fragments.map((message) => message.text).join("\n").slice(0, 2000),
+    inputText: lines.join("\n"),
   };
 }
 
@@ -154,38 +179,12 @@ export function buildExtractionPrompt(
   ].join("\n");
 }
 
-function parseJsonArray(text: string): unknown {
-  const trimmed = text.trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    // try a fenced block, then the first bracketed array
-  }
-
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1];
-  if (fenced) {
-    try {
-      return JSON.parse(fenced);
-    } catch {
-      // fall through
-    }
-  }
-
-  const start = trimmed.indexOf("[");
-  const end = trimmed.lastIndexOf("]");
-  if (start >= 0 && end > start) {
-    return JSON.parse(trimmed.slice(start, end + 1));
-  }
-  throw new Error("提取结果不是 JSON 数组");
-}
-
 /** Parse and shape-check the model output. Service still validates category/length/secrets. */
 export function parseExtractionItems(
   text: string,
   maxItems: number
 ): { items: ExtractItem[]; skipped: number } {
-  const parsed = parseJsonArray(text);
-  if (!Array.isArray(parsed)) throw new Error("提取结果不是 JSON 数组");
+  const parsed = parseModelArray(text);
 
   const items: ExtractItem[] = [];
   let skipped = 0;
@@ -204,11 +203,15 @@ export function parseExtractionItems(
     const category = typeof value.category === "string" ? value.category.trim() : "";
     const content = typeof value.content === "string" ? value.content.trim() : "";
     const id = typeof value.id === "string" ? value.id.trim() : "";
+    const evidenceIndex = value.evidence_index;
+    const evidenceQuote = typeof value.evidence_quote === "string" ? value.evidence_quote.trim() : "";
     const relatedFiles = Array.isArray(value.related_files)
       ? value.related_files.filter((item): item is string => typeof item === "string")
       : [];
 
-    if (!action || !title || !category || !content || (action === "update" && !id)) {
+    if (!action || !title || !category || !content || (action === "update" && !id) ||
+        typeof evidenceIndex !== "number" || !Number.isSafeInteger(evidenceIndex) ||
+        evidenceIndex < 1 || !evidenceQuote) {
       skipped++;
       continue;
     }
@@ -219,23 +222,85 @@ export function parseExtractionItems(
       category,
       content,
       related_files: relatedFiles,
+      evidence_index: evidenceIndex,
+      evidence_quote: evidenceQuote,
     });
   }
   return { items, skipped };
 }
 
+async function groundItems(
+  items: ExtractItem[],
+  messages: ExtractMessage[],
+  oldMemories: MemoryHit[],
+  sessionID: string,
+  verify: VerifyEvidence,
+  blockedPatterns: string[]
+): Promise<AutoMutation[]> {
+  const existing = new Map(oldMemories.map((item) => [item.id, item]));
+  const candidates: Array<{ item: AutoMutation; review: EvidenceReview }> = [];
+  for (const { evidence_index, evidence_quote, ...item } of items) {
+    const evidence = messages[evidence_index - 1];
+    if (evidence?.role !== "user" || evidence_quote.includes("[REDACTED]") ||
+        !evidence.text.includes(evidence_quote) ||
+        !compatibleEvidence(item.content, evidence_quote)) continue;
+    const containsBlockedText = [item.title, item.content, ...item.related_files]
+      .some((text) => redactSecrets(text, blockedPatterns).hits > 0);
+    if (containsBlockedText) continue;
+    const previous = item.id ? existing.get(item.id) : undefined;
+    if (item.action === "update" && !previous) continue;
+    candidates.push({
+      item: {
+        ...item,
+        version: previous?.version,
+        source_ref: sessionSourceRef(sessionID, evidence.id),
+        evidence_at: evidence.created || undefined,
+      },
+      review: {
+        action: item.action,
+        title: item.title,
+        category: item.category,
+        content: item.content,
+        related_files: item.related_files,
+        quote: evidence_quote,
+        evidence: evidence.text,
+        previous,
+        neighbors: item.action === "add" ? oldMemories : undefined,
+      },
+    });
+  }
+  if (!candidates.length) return [];
+  const decisions = await verify(candidates.map(({ review }) => review));
+  if (decisions.length !== candidates.length) throw new Error("核验结果数量不符");
+  const updates = new Set<string>();
+  return candidates.flatMap(({ item }, index) => {
+    const decision = decisions[index];
+    if (!decision?.supported || (item.id && updates.has(item.id))) return [];
+    if (item.id) updates.add(item.id);
+    return [{
+      ...item,
+      comparisons: oldMemories.flatMap(({ id, version }) => {
+        const relation = decision.conflicts_with?.includes(id) ? "conflict"
+          : decision.same_as?.includes(id) ? "same"
+          : decision.distinct_from?.includes(id) ? "distinct" : undefined;
+        return relation ? [{ id, version, relation }] : [];
+      }),
+    }];
+  });
+}
+
 export interface ExtractionDeps {
   service: MemoryService;
   generate: (prompt: string) => Promise<string>;
+  verify: VerifyEvidence;
   readPrompt: () => string;
   getMessages: (sessionID: string) => Promise<RawSessionMessage[]>;
   now?: () => number;
 }
 
 /**
- * Runs at most one extraction model call per idle. A successful call or a
- * non-retryable failure advances the watermark. Transient failures keep it in
- * place, use a failure cooldown, and give up after two attempts.
+ * Runs one extraction and at most one verification call per idle. A failed batch stays at
+ * its last committed checkpoint and can be retried on a later idle.
  */
 export async function runAutoExtraction(
   sessionID: string,
@@ -262,17 +327,14 @@ export async function runAutoExtraction(
     try {
       rawMessages = await deps.getMessages(sessionID);
     } catch (error) {
-      log("auto extraction: read messages failed", { error: errorMessage(error) });
+      log("auto extraction: read messages failed");
       return { status: "failed", reason: "read_messages" };
     }
 
-    const all = toExtractMessages(rawMessages);
-    const incrementMessages = selectIncrement(
-      all,
-      state.last_extracted_message_id,
-      config.autoExtract.maxMessages
-    );
-    if (!incrementMessages) return { status: "skipped", reason: "no_increment" };
+    const cursor: ExtractionCursor = {
+      messageId: state.last_extracted_message_id,
+      offset: state.last_extracted_offset,
+    };
 
     // Redact with the same rules used by the write path before any truncation,
     // so a secret split by a slice boundary cannot leak. Only counts and rule
@@ -280,7 +342,8 @@ export async function runAutoExtraction(
     let redactionHits = 0;
     const redactionRules = new Set<string>();
     const increment = buildIncrement(
-      incrementMessages,
+      toExtractMessages(rawMessages),
+      cursor,
       config.autoExtract,
       (text) => {
         const result = redactSecrets(text, config.blockedPatterns);
@@ -289,11 +352,22 @@ export async function runAutoExtraction(
         return result.text;
       }
     );
-    if (!increment) return { status: "skipped", reason: "no_user_text" };
-    if (
+    if (!increment) return { status: "skipped", reason: "no_increment" };
+    // A queued tail should be processed even when shorter than the usual
+    // minimum. Skip the success cooldown until the backlog is drained.
+    const hasBacklog = cursor.messageId !== null && state.last_extracted_at === null;
+    const completedAt = increment.hasMore ? null : now;
+    if (increment.userCount === 0) {
+      // Assistant-only material cannot substantiate a new memory.
+      const applied = await deps.service.applyExtractionBatch(
+        sessionID, cursor, increment.next, increment.hasMore ? null : state.last_extracted_at, []
+      );
+      return { status: "skipped", reason: applied ? "no_user_text" : "progress_changed" };
+    }
+    if (!increment.hasMore && !hasBacklog && (
       increment.userCount < config.autoExtract.minNewMessages ||
       increment.totalChars < config.autoExtract.minInputChars
-    ) {
+    )) {
       return { status: "skipped", reason: "too_short" };
     }
     if (redactionHits > 0) {
@@ -303,42 +377,30 @@ export async function runAutoExtraction(
       });
     }
 
-    const failTransient = async (reason: string): Promise<ExtractionOutcome> => {
+    const failBatch = async (reason: string): Promise<ExtractionOutcome> => {
       const attempts = await deps.service.recordExtractionFailure(
         sessionID,
-        increment.nextLastId,
+        cursor,
+        increment.next,
         now
       );
-      log("auto extraction: transient failure", {
-        reason,
-        attempts,
-        max_attempts: MAX_EXTRACTION_ATTEMPTS,
-      });
-      if (attempts >= MAX_EXTRACTION_ATTEMPTS) {
-        await deps.service.setSessionState(sessionID, increment.nextLastId, now);
-        log("auto extraction: attempt limit reached, watermark advanced", {
-          reason,
-          attempts,
-        });
-      }
+      if (attempts === undefined) return { status: "skipped", reason: "progress_changed" };
+      log("auto extraction: batch retained", { reason, attempts });
       return { status: "failed", reason, attempts };
     };
 
     let oldMemories: MemoryHit[];
     try {
-      oldMemories = await deps.service.search(increment.queryText, 3);
-    } catch (error) {
-      log("auto extraction: retrieval failed", { error: errorMessage(error) });
-      return failTransient("retrieval");
+      oldMemories = await deps.service.search(increment.queryText, 5, true);
+    } catch {
+      return await failBatch("retrieval");
     }
 
     let basePrompt: string;
     try {
       basePrompt = deps.readPrompt();
-    } catch (error) {
-      log("auto extraction: prompt missing", { error: errorMessage(error) });
-      await deps.service.setSessionState(sessionID, increment.nextLastId, now);
-      return { status: "failed", reason: "prompt" };
+    } catch {
+      return await failBatch("prompt");
     }
 
     let output: string;
@@ -346,81 +408,52 @@ export async function runAutoExtraction(
       output = await deps.generate(
         buildExtractionPrompt(basePrompt, oldMemories, increment.inputText)
       );
-    } catch (error) {
-      log("auto extraction: generate failed", { error: errorMessage(error) });
-      if (isTransientFailure(error)) return failTransient("generate");
-      await deps.service.setSessionState(sessionID, increment.nextLastId, now);
-      log("auto extraction: non-retryable generate error, watermark advanced", {});
-      return { status: "failed", reason: "generate" };
+    } catch {
+      return await failBatch("generate");
     }
-
-    // The model answered: consume the increment even if its JSON is invalid.
-    await deps.service.setSessionState(sessionID, increment.nextLastId, now);
 
     let parsed: { items: ExtractItem[]; skipped: number };
     try {
       parsed = parseExtractionItems(output, config.autoExtract.maxItems);
-    } catch (error) {
-      log("auto extraction: invalid output", { error: errorMessage(error) });
-      return { status: "failed", reason: "parse" };
+    } catch {
+      return await failBatch("parse");
     }
 
-    if (config.autoCaptureDryRun) {
-      const captured = appendDryRun(config, sessionID, parsed.items, now);
-      log("auto extraction: dry run captured", {
-        captured,
-        skipped: parsed.skipped,
-      });
-      return {
-        status: "ok",
-        added: 0,
-        updated: 0,
-        skippedItems: parsed.skipped,
-        dryRun: true,
-        captured,
-      };
+    let items: AutoMutation[];
+    try {
+      items = await groundItems(parsed.items, increment.messages, oldMemories, sessionID, deps.verify, config.blockedPatterns);
+    } catch {
+      return await failBatch("verify");
     }
-
-    let added = 0;
-    let updated = 0;
-    let skippedItems = parsed.skipped;
-    for (const item of parsed.items) {
-      try {
-        await deps.service.autoMutate(item);
-        if (item.action === "add") added++;
-        else updated++;
-      } catch (error) {
-        skippedItems++;
-        log("auto extraction: item skipped", {
-          code: error instanceof MemoryError ? error.code : "error",
-          action: item.action,
-        });
+    const skipped = parsed.skipped + parsed.items.length - items.length;
+    try {
+      if (config.autoCaptureDryRun) {
+        const captured = appendDryRun(config, sessionID, items, now);
+        const applied = await deps.service.applyExtractionBatch(sessionID, cursor, increment.next, completedAt, []);
+        if (!applied) return { status: "skipped", reason: "progress_changed" };
+        log("auto extraction: dry run captured", { captured, skipped });
+        return { status: "ok", added: 0, updated: 0, skippedItems: skipped, dryRun: true, captured };
       }
+      const applied = await deps.service.applyExtractionBatch(sessionID, cursor, increment.next, completedAt, items);
+      if (!applied) return { status: "skipped", reason: "progress_changed" };
+      const { added, updated, conflicts } = applied;
+      const skippedItems = skipped + applied.skipped;
+      log("auto extraction: finished", { added, updated, conflicts, skipped: skippedItems });
+      return { status: "ok", added, updated, conflicts, skippedItems };
+    } catch {
+      return await failBatch("write");
     }
-
-    log("auto extraction: finished", { added, updated, skipped: skippedItems });
-    return { status: "ok", added, updated, skippedItems };
-  } catch (error) {
-    log("auto extraction: failed", { error: errorMessage(error) });
+  } catch {
+    log("auto extraction: failed");
     return { status: "failed", reason: "unexpected" };
   }
-}
-
-function isTransientFailure(error: unknown): boolean {
-  const name =
-    error && typeof error === "object" && "name" in error ? String(error.name) : "";
-  if (name === "AbortError" || name === "TimeoutError") return true;
-  const message = errorMessage(error).toLowerCase();
-  return /timeout|timed out|aborted|rate.?limit|too many requests|429|econnreset|econnrefused|enotfound|eai_again|network|fetch failed|socket hang up|connection (?:reset|closed|refused)|temporar|overloaded|unavailable|\b50[0234]\b/.test(
-    message
-  );
 }
 
 /** Append redacted extraction candidates without touching the database. */
 function appendDryRun(
   config: CortexConfig,
   sessionID: string,
-  items: ExtractItem[],
+  items: AutoMutation[],
   now: number
 ): number {
   const path = join(config.storagePath, "dry-run.jsonl");
@@ -429,7 +462,7 @@ function appendDryRun(
   const lines = items.map((item) => {
     const title = redactSecrets(item.title, config.blockedPatterns).text;
     const content = redactSecrets(item.content, config.blockedPatterns).text;
-    const relatedFiles = item.related_files.map(
+    const relatedFiles = (item.related_files ?? []).map(
       (file) => redactSecrets(file, config.blockedPatterns).text
     );
     return JSON.stringify({
@@ -441,12 +474,9 @@ function appendDryRun(
       category: item.category,
       content,
       related_files: relatedFiles,
+      source_ref: item.source_ref,
     });
   });
   if (lines.length > 0) appendFileSync(path, `${lines.join("\n")}\n`, "utf-8");
   return lines.length;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

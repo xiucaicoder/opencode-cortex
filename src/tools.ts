@@ -1,6 +1,16 @@
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { MemoryService, MutateInput, MutateResult } from "./memory-service.js";
 import { MemoryError } from "./memory-service.js";
+import { compatibleEvidence, sessionSourceRef, type VerifyEvidence } from "./evidence.js";
+import { toExtractMessages, type RawSessionMessage } from "./extraction.js";
+import { redactSecrets } from "./secrets.js";
+
+interface ToolWriteDeps {
+  getMessages: (sessionID: string) => Promise<RawSessionMessage[]>;
+  verify: VerifyEvidence;
+  blockedPatterns: string[];
+  onWrite: () => void;
+}
 
 const SEARCH_INPUT = {
   type: "object",
@@ -49,12 +59,12 @@ const MUTATE_INPUT = {
       items: { type: "string" },
       description: "相关文件路径，可选。",
     },
-    source_ref: {
+    evidence_quote: {
       type: "string",
-      description: "来源引用（如 issue、文档或会话 id），可选；提供时按 import 来源记录。",
+      description: "当前开发者消息中明确支持本操作的连续原话。",
     },
   },
-  required: ["action"],
+  required: ["action", "evidence_quote"],
   additionalProperties: false,
 } as const;
 
@@ -70,16 +80,17 @@ function errorContent(error: unknown): string {
   return JSON.stringify({
     success: false,
     code: "internal_error",
-    error: error instanceof Error ? error.message : String(error),
+    error: "操作未完成，请重试。",
   });
 }
 
-export async function registerMemoryTools(ctx: Context, service: MemoryService): Promise<void> {
+export async function registerMemoryTools(ctx: Context, service: MemoryService, deps: ToolWriteDeps): Promise<void> {
   await ctx.tool.transform((editor) => {
     editor.add({
       name: "memory_search",
+      options: { codemode: true, pinned: true },
       description:
-        "检索本项目已沉淀的业务规则、架构决策、数据约束和踩坑记录。在修改业务逻辑、数据结构或状态流转之前，必须先调用本工具确认既有约束，避免只按代码字面实现而违反业务规则。仅返回 active 条目；需要修改或归档时，使用返回的 id 和 version。",
+        "检索本项目已沉淀的业务规则、架构决策、数据约束和踩坑记录。在修改业务逻辑、数据结构或状态流转之前，必须先调用本工具确认既有约束，避免只按代码字面实现而违反业务规则。仅返回可用的 active 条目；需要修改或归档时，使用返回的 id 和 version。",
       input: SEARCH_INPUT as unknown as never,
       execute: async (args: { query?: string; limit?: number }) => {
         try {
@@ -93,14 +104,67 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService):
 
     editor.add({
       name: "memory_mutate",
+      options: { codemode: true, pinned: true },
       description:
-        "写入项目记忆。仅在开发者明确确认了新的业务规则、架构决策、数据约束或踩坑结论后调用；AI 自己的推测、未验证方案和调试过程不要写入。修改已有条目之前先调用 memory_search 获取 id 和 version，update/delete 必须带 id 和 version。content 最多 200 字，category 必须是四类之一；add 前会做相似去重，命中重复时请用 update 合并；add 成功后会在 related 中返回最相近的已有条目，请据此判断是否应改为 update。",
+        "写入项目记忆。仅在开发者明确确认了新的业务规则、架构决策、数据约束或踩坑结论后调用；AI 自己的推测、未验证方案和调试过程不要写入。修改已有条目之前先调用 memory_search 获取 id 和 version，update/delete 必须带 id 和 version。content 最多 200 字，category 必须是四类之一；必须提供当前开发者消息中的证据。仅在证据明确替代原规则时用 update。",
       input: MUTATE_INPUT as unknown as never,
-      execute: async (args: MutateInput) => {
+      execute: async (args: MutateInput & { evidence_quote?: string }, context) => {
         try {
-          const result: MutateResult = await service.mutate(args, "tool");
+          const { action, id, version, title, category, content, related_files } = args;
+          if (action !== "add" && action !== "update" && action !== "delete") {
+            throw new MemoryError("invalid_action", "未知记忆操作");
+          }
+          if (typeof content === "string" && [...content.trim()].length > 200) {
+            throw new MemoryError("content_too_long", "记忆正文最多 200 字");
+          }
+          const messages = toExtractMessages(await deps.getMessages(context.sessionID));
+          const callIndex = messages.findIndex((message) => message.id === context.messageID);
+          const user = messages.slice(0, callIndex < 0 ? undefined : callIndex + 1)
+            .findLast((message) => message.role === "user");
+          const quote = typeof args.evidence_quote === "string" ? args.evidence_quote.trim() : "";
+          const evidence = user ? redactSecrets(user.text, deps.blockedPatterns).text : "";
+          if (!user || !quote || quote.includes("[REDACTED]") || !evidence.includes(quote) ||
+              !compatibleEvidence(content ?? "", quote)) {
+            throw new MemoryError("unverified_evidence", "当前开发者消息没有可核实的证据");
+          }
+          const previous = action !== "add" && id ? await service.getActive(id) : undefined;
+          if (action !== "add" && (!previous || previous.version !== version)) {
+            throw new MemoryError("version_conflict", "请提供当前记忆的 id 和版本");
+          }
+          const neighbors = action === "add" && content ? await service.search(content, 5, true) : [];
+          const redact = (value: string | undefined) => value === undefined ? undefined
+            : redactSecrets(value, deps.blockedPatterns).text;
+          const safeTitle = redact(title);
+          const safeContent = redact(content);
+          const safeFiles = related_files?.map((file) => redact(file)!);
+          if (safeTitle !== title || safeContent !== content ||
+              safeFiles?.some((file, index) => file !== related_files?.[index])) {
+            throw new MemoryError("blocked_secret", "候选含敏感信息");
+          }
+          const quoteStart = evidence.indexOf(quote);
+          if (quote.length > 2000) throw new MemoryError("unverified_evidence", "请提供短引文");
+          const excerpt = evidence.slice(Math.max(0, quoteStart - 5000), quoteStart + quote.length + 5000);
+          const [decision] = await deps.verify([{
+            action, title, category, content, related_files, evidence: excerpt, quote, previous, neighbors,
+          }]);
+          if (!decision?.supported) {
+            throw new MemoryError("unverified_evidence", "证据不足以支持此操作");
+          }
+          const result: MutateResult = await service.mutateVerified({
+            action, id, version, title, category, content, related_files,
+            source_ref: sessionSourceRef(context.sessionID, user.id),
+            evidence_at: user.created || undefined,
+            comparisons: neighbors.flatMap(({ id, version }) => {
+              const relation = decision.conflicts_with?.includes(id) ? "conflict"
+                : decision.same_as?.includes(id) ? "same"
+                : decision.distinct_from?.includes(id) ? "distinct" : undefined;
+              return relation ? [{ id, version, relation }] : [];
+            }),
+          });
+          deps.onWrite();
           return { content: JSON.stringify(result) };
         } catch (error) {
+          if (error instanceof MemoryError && error.code === "possible_conflict") deps.onWrite();
           return { content: errorContent(error) };
         }
       },

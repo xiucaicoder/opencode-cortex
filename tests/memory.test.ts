@@ -291,6 +291,21 @@ describe("dedup thresholds", () => {
 });
 
 describe("versioned updates", () => {
+  it("retains the prior rule and source after an update", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const original = await runtime.service.mutate({ action: "add", title: "售后时限", category: "domain_rule", content: "售后时限为180天", source_ref: "old" });
+      await runtime.service.mutate({ action: "update", id: original.id, version: original.version, title: "售后时限", category: "domain_rule", content: "售后时限为90天", source_ref: "new" });
+      const { connect } = await import("@tursodatabase/database");
+      const db = await connect(runtime.dbPath);
+      try {
+        const row = await db.get("SELECT content, source_ref, version FROM memory_history WHERE memory_id = ?", original.id);
+        expect(row).toMatchObject({ content: "售后时限为180天", source_ref: "old", version: 1 });
+        const current = (await runtime.service.listActive())[0];
+        expect(current?.content).toBe("售后时限为90天");
+      } finally { await db.close(); }
+    } finally { await runtime.cleanup(); }
+  });
   it("increments version and rejects stale writes", async () => {
     const runtime = createTestRuntime();
     try {

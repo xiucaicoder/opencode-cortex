@@ -23,7 +23,15 @@ describe("tool registration", () => {
     } as unknown as Context;
 
     try {
-      await registerMemoryTools(ctx, runtime.service);
+      await registerMemoryTools(ctx, runtime.service, {
+        getMessages: async () => [
+          { id: "user-message", type: "user", text: "工具写入走同一服务，但是否启用自动归档还没定" },
+        ],
+        verify: async (reviews) => reviews.map((review) => ({ supported: review.content === "工具写入走同一服务" })),
+        blockedPatterns: [],
+        onWrite: () => {},
+      });
+      const toolContext = { sessionID: "s1", messageID: "assistant-message" };
       expect(added.map((tool) => tool.name)).toEqual(["memory_search", "memory_mutate"]);
 
       const mutate = added.find((tool) => tool.name === "memory_mutate")!;
@@ -35,8 +43,9 @@ describe("tool registration", () => {
               title: "工具测试",
               category: "arch_decision",
               content: "工具写入走同一服务",
+              evidence_quote: "工具写入走同一服务",
             },
-            {}
+            toolContext
           )
         ).content
       ) as { success: boolean; id: string; version: number };
@@ -50,6 +59,15 @@ describe("tool registration", () => {
       expect(hits).toHaveLength(1);
       expect(hits[0]?.id).toBe(addResult.id);
       expect(hits[0]?.version).toBe(1);
+
+      const rejected = await mutate.execute({
+        action: "add", title: "自动归档", category: "arch_decision", content: "启用自动归档",
+        evidence_quote: "是否启用自动归档还没定",
+      }, toolContext);
+      expect(JSON.parse(rejected.content)).toMatchObject({ code: "unverified_evidence" });
+      expect((await runtime.service.listActive())[0]).toMatchObject({
+        source: "manual", source_ref: "opencode-session:s1/message:user-message",
+      });
 
       const invalid = JSON.parse(
         (

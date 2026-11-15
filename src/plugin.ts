@@ -6,6 +6,7 @@ import { log } from "./logger.js";
 import { buildInjectionText, InjectionCache } from "./inject.js";
 import { runAutoExtraction, type RawSessionMessage } from "./extraction.js";
 import { createRuntime } from "./runtime.js";
+import { createDecisionVerifier, createEvidenceVerifier, type VerifyEvidence } from "./evidence.js";
 import { registerMemoryTools } from "./tools.js";
 
 type ModelRef = { providerID: string; id: string; variant?: string };
@@ -48,7 +49,6 @@ const OpenCodeCortexPlugin: Plugin = {
   async setup(ctx) {
     const runtime = createRuntime(ctx.location.directory);
     const { config, service } = runtime;
-    await registerMemoryTools(ctx, service);
 
     const injectionCache = new InjectionCache(async () =>
       buildInjectionText(
@@ -90,6 +90,26 @@ const OpenCodeCortexPlugin: Plugin = {
     const getMessages = async (sessionID: string): Promise<RawSessionMessage[]> =>
       (await ctx.session.context({ sessionID })) as unknown as RawSessionMessage[];
 
+    const verifyText = createEvidenceVerifier(generate);
+    const verifyDecisions = createDecisionVerifier(async (input, questions) => {
+      const model = await resolveModelRef(ctx, config);
+      const result = await ctx.experimental.generate.decisions(
+        { model, input: [{ type: "text", text: input }], questions },
+        { signal: AbortSignal.timeout(config.autoExtract.timeoutMs) }
+      );
+      return new Map(result.answers.flatMap((answer) =>
+        answer.type === "choice" && typeof answer.choice === "string" ? [[answer.name, answer.choice]] : []));
+    });
+    const verify: VerifyEvidence = async (reviews) => {
+      try {
+        return await verifyDecisions(reviews);
+      } catch {
+        // Some providers only support text generation. Both paths require explicit evidence decisions.
+        return verifyText(reviews);
+      }
+    };
+    await registerMemoryTools(ctx, service, { getMessages, verify, blockedPatterns: config.blockedPatterns, onWrite: () => injectionCache.clearAll() });
+
     await ctx.session.hook("experimental.idle", (event) => {
       if (!config.autoExtract.enabled) return;
       if (running.has(event.sessionID)) return;
@@ -104,14 +124,18 @@ const OpenCodeCortexPlugin: Plugin = {
             });
             return;
           }
-          await runAutoExtraction(event.sessionID, config, {
+          log("auto extraction: idle received", { session_id: event.sessionID });
+          const outcome = await runAutoExtraction(event.sessionID, config, {
             service,
             generate,
+            verify,
             readPrompt: readExtractionPrompt,
             getMessages,
           });
-        } catch (error) {
-          log("auto extraction: unexpected", { error: errorMessage(error) });
+          if (outcome.added || outcome.updated || outcome.conflicts) injectionCache.clearAll();
+          if (outcome.status === "skipped") log("auto extraction: skipped", { reason: outcome.reason });
+        } catch {
+          log("auto extraction: unexpected");
         } finally {
           running.delete(event.sessionID);
         }

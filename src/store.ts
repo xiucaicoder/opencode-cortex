@@ -1,4 +1,4 @@
-import { connect, type Database } from "@tursodatabase/database";
+import { connect, type Database, type Transaction } from "@tursodatabase/database";
 import type { EncryptionOpts } from "@tursodatabase/database-common";
 import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -39,6 +39,8 @@ export interface MemorySearchHit extends MemoryRecord {
 
 export interface NearestMemory {
   id: string;
+  available: boolean;
+  version: number;
   title: string;
   content: string;
   source: MemorySource;
@@ -54,7 +56,25 @@ export interface StoreOptions {
   encryption?: EncryptionOpts | null;
 }
 
+export interface ExtractionCursor {
+  messageId: string | null;
+  offset: number;
+}
+
+export interface SessionState {
+  last_extracted_message_id: string | null;
+  last_extracted_offset: number;
+  last_extracted_at: number | null;
+  attempt_target_id: string | null;
+  failed_attempts: number;
+  failed_at: number | null;
+}
+
 const SCHEMA_VERSION = "1";
+const AVAILABLE_MEMORY = `status = 'active' AND NOT EXISTS (
+  SELECT 1 FROM memory_conflicts
+  WHERE memory_id = memories.id AND memory_version = memories.version AND blocks_recall = 1
+)`;
 
 function parseRelatedFiles(value: unknown): string[] {
   if (typeof value !== "string" || !value) return [];
@@ -124,6 +144,7 @@ export function tokenizeQuery(text: string): string[] {
 export class MemoryStore {
   private db: Database | null = null;
   private opening: Promise<Database> | null = null;
+  private transaction: Transaction | null = null;
 
   constructor(private readonly options: StoreOptions) {}
 
@@ -136,6 +157,20 @@ export class MemoryStore {
     this.db = null;
     this.opening = null;
     await db?.close();
+  }
+
+  async inTransaction<T>(fn: (store: MemoryStore) => Promise<T>): Promise<T> {
+    if (this.transaction) return fn(this);
+    const db = await this.connection();
+    return db.transactionAsync(async (transaction) => {
+      const store = new MemoryStore(this.options);
+      store.transaction = transaction;
+      return fn(store);
+    }).immediate();
+  }
+
+  private async query(): Promise<Database | Transaction> {
+    return this.transaction ?? this.connection();
   }
 
   private async connection(): Promise<Database> {
@@ -198,6 +233,7 @@ export class MemoryStore {
         CREATE TABLE IF NOT EXISTS session_state (
           session_id TEXT PRIMARY KEY,
           last_extracted_message_id TEXT,
+          last_extracted_offset INTEGER NOT NULL DEFAULT 0,
           last_extracted_at INTEGER,
           attempt_target_id TEXT,
           failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -229,6 +265,7 @@ export class MemoryStore {
         ],
         "immediate"
       );
+      await this.ensureMemoryHistory(db);
       return;
     }
 
@@ -278,6 +315,7 @@ export class MemoryStore {
       CREATE TABLE IF NOT EXISTS session_state (
         session_id TEXT PRIMARY KEY,
         last_extracted_message_id TEXT,
+        last_extracted_offset INTEGER NOT NULL DEFAULT 0,
         last_extracted_at INTEGER,
         attempt_target_id TEXT,
         failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -285,6 +323,57 @@ export class MemoryStore {
       )
     `);
     await this.ensureSessionStateColumns(db);
+    await this.ensureMemoryHistory(db);
+  }
+
+  /** Keep the previous state atomically for updates and archives. */
+  private async ensureMemoryHistory(db: Database): Promise<void> {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_history (
+        memory_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        category TEXT NOT NULL,
+        content TEXT NOT NULL,
+        related_files TEXT NOT NULL,
+        source TEXT NOT NULL,
+        source_ref TEXT,
+        status TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (memory_id, version)
+      );
+      CREATE TABLE IF NOT EXISTS memory_conflicts (
+        memory_id TEXT NOT NULL,
+        memory_version INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        source_ref TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        blocks_recall INTEGER NOT NULL,
+        PRIMARY KEY (memory_id, memory_version, content, source_ref)
+      );
+      CREATE TABLE IF NOT EXISTS memory_evidence_times (
+        memory_id TEXT PRIMARY KEY,
+        evidence_at INTEGER NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS memories_history_before_update
+      BEFORE UPDATE ON memories
+      WHEN NEW.version > OLD.version
+      BEGIN
+        INSERT INTO memory_history
+          (memory_id, version, title, category, content, related_files, source, source_ref, status, updated_at)
+        VALUES
+          (OLD.id, OLD.version, OLD.title, OLD.category, OLD.content, OLD.related_files, OLD.source, OLD.source_ref, OLD.status, OLD.updated_at);
+      END;
+    `);
+    await db.transactionAsync(async (tx) => {
+      const columns = await tx.all("PRAGMA table_info(memory_conflicts)") as Array<{ name: string }>;
+      if (!columns.some(({ name }) => name === "blocks_recall")) {
+        // Earlier candidates had no confirmed-contradiction flag.
+        await tx.exec("ALTER TABLE memory_conflicts ADD COLUMN blocks_recall INTEGER NOT NULL DEFAULT 0");
+      }
+    }).immediate();
   }
 
   /** Stage 2 generated UUIDs; shorten them once while keeping ids unique. */
@@ -315,22 +404,25 @@ export class MemoryStore {
     return changed;
   }
 
-  /** Stage 2 shipped a three-column table; add attempt tracking in place. */
+  /** Add extraction progress fields to existing schema v1 databases. */
   private async ensureSessionStateColumns(db: Database): Promise<void> {
-    const rows = (await db.all("PRAGMA table_info(session_state)")) as Array<{
-      name?: string;
-    }>;
-    const existing = new Set(rows.map((row) => String(row.name)));
     const columns: Array<[string, string]> = [
+      ["last_extracted_offset", "INTEGER NOT NULL DEFAULT 0"],
       ["attempt_target_id", "TEXT"],
       ["failed_attempts", "INTEGER NOT NULL DEFAULT 0"],
       ["failed_at", "INTEGER"],
     ];
-    for (const [name, definition] of columns) {
-      if (!existing.has(name)) {
-        await db.exec(`ALTER TABLE session_state ADD COLUMN ${name} ${definition}`);
+    await db.transactionAsync(async (transaction) => {
+      const rows = (await transaction.all("PRAGMA table_info(session_state)")) as Array<{
+        name?: string;
+      }>;
+      const existing = new Set(rows.map((row) => String(row.name)));
+      for (const [name, definition] of columns) {
+        if (!existing.has(name)) {
+          await transaction.exec(`ALTER TABLE session_state ADD COLUMN ${name} ${definition}`);
+        }
       }
-    }
+    }).immediate();
   }
 
   private async getMetaWith(db: Database, key: string): Promise<string | null> {
@@ -359,28 +451,17 @@ export class MemoryStore {
     await this.setMeta("project_name", info.name);
   }
 
-  async getSessionState(sessionID: string): Promise<{
-    last_extracted_message_id: string | null;
-    last_extracted_at: number | null;
-    attempt_target_id: string | null;
-    failed_attempts: number;
-    failed_at: number | null;
-  }> {
-    const db = await this.connection();
+  async getSessionState(sessionID: string): Promise<SessionState> {
+    const db = await this.query();
     const row = (await db.get(
-      `SELECT last_extracted_message_id, last_extracted_at, attempt_target_id,
+      `SELECT last_extracted_message_id, last_extracted_offset, last_extracted_at, attempt_target_id,
               failed_attempts, failed_at
        FROM session_state WHERE session_id = ?`,
       sessionID
-    )) as {
-      last_extracted_message_id?: string;
-      last_extracted_at?: number;
-      attempt_target_id?: string;
-      failed_attempts?: number;
-      failed_at?: number;
-    } | null;
+    )) as Partial<SessionState> | null;
     return {
       last_extracted_message_id: row?.last_extracted_message_id ?? null,
+      last_extracted_offset: row?.last_extracted_offset ?? 0,
       last_extracted_at: row?.last_extracted_at ?? null,
       attempt_target_id: row?.attempt_target_id ?? null,
       failed_attempts: row?.failed_attempts ?? 0,
@@ -389,28 +470,30 @@ export class MemoryStore {
   }
 
   /** Advance the watermark and clear all retry bookkeeping. */
-  async setSessionState(sessionID: string, messageID: string, at: number): Promise<void> {
-    const db = await this.connection();
+  async setSessionState(sessionID: string, cursor: ExtractionCursor, at: number | null): Promise<void> {
+    const db = await this.query();
     await db.run(
       `INSERT INTO session_state (
-         session_id, last_extracted_message_id, last_extracted_at,
+         session_id, last_extracted_message_id, last_extracted_offset, last_extracted_at,
          attempt_target_id, failed_attempts, failed_at
-       ) VALUES (?, ?, ?, NULL, 0, NULL)
+       ) VALUES (?, ?, ?, ?, NULL, 0, NULL)
        ON CONFLICT(session_id) DO UPDATE SET
          last_extracted_message_id = excluded.last_extracted_message_id,
+         last_extracted_offset = excluded.last_extracted_offset,
          last_extracted_at = excluded.last_extracted_at,
          attempt_target_id = NULL,
          failed_attempts = 0,
          failed_at = NULL`,
       sessionID,
-      messageID,
+      cursor.messageId,
+      cursor.offset,
       at
     );
   }
 
   /**
-   * Record a transient failure without moving the watermark. Attempts reset
-   * when the target message changes, so the cap applies to one increment only.
+   * Record a batch failure without moving the watermark. Attempts reset
+   * when the target message changes.
    */
   async recordExtractionFailure(
     sessionID: string,
@@ -420,7 +503,7 @@ export class MemoryStore {
     const state = await this.getSessionState(sessionID);
     const attempts =
       state.attempt_target_id === targetMessageID ? state.failed_attempts + 1 : 1;
-    const db = await this.connection();
+    const db = await this.query();
     await db.run(
       `INSERT INTO session_state (
          session_id, attempt_target_id, failed_attempts, failed_at
@@ -446,7 +529,7 @@ export class MemoryStore {
   }
 
   async insert(record: MemoryRecord, vector: Float32Array): Promise<void> {
-    const db = await this.connection();
+    const db = await this.query();
     await db.run(
       `INSERT INTO memories (
         id, title, category, content, related_files, source, source_ref,
@@ -470,7 +553,7 @@ export class MemoryStore {
     expectedVersion: number,
     vector: Float32Array
   ): Promise<number> {
-    const db = await this.connection();
+    const db = await this.query();
     const result = await db.run(
       `UPDATE memories
        SET title = ?, category = ?, content = ?, related_files = ?, source_ref = ?,
@@ -490,7 +573,7 @@ export class MemoryStore {
   }
 
   async archive(id: string, expectedVersion: number, updatedAt: number): Promise<number> {
-    const db = await this.connection();
+    const db = await this.query();
     const result = await db.run(
       `UPDATE memories
        SET status = 'archived', version = version + 1, updated_at = ?
@@ -503,16 +586,52 @@ export class MemoryStore {
   }
 
   async getById(id: string): Promise<MemoryRecord | null> {
-    const db = await this.connection();
+    const db = await this.query();
     const row = await db.get("SELECT * FROM memories WHERE id = ?", id);
     return row ? rowToRecord(row as Record<string, unknown>) : null;
   }
 
+  async recordConflict(id: string, version: number, candidate: {
+    title: string; category: string; content: string; source_ref: string; blocksRecall: boolean;
+  }): Promise<void> {
+    const db = await this.query();
+    await db.run(
+      `INSERT INTO memory_conflicts
+        (memory_id, memory_version, category, title, content, source_ref, created_at, blocks_recall)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(memory_id, memory_version, content, source_ref) DO UPDATE
+        SET blocks_recall = max(memory_conflicts.blocks_recall, excluded.blocks_recall)`,
+      id, version, candidate.category, candidate.title, candidate.content, candidate.source_ref, Date.now(),
+      Number(candidate.blocksRecall)
+    );
+  }
+
+  async listConflicts(): Promise<unknown[]> {
+    const db = await this.query();
+    return db.all(`SELECT c.*, m.title AS current_title, m.content AS current_content
+      FROM memory_conflicts c JOIN memories m ON m.id = c.memory_id AND m.version = c.memory_version
+      WHERE m.status = 'active' ORDER BY c.created_at DESC`);
+  }
+
+  async getEvidenceTime(id: string): Promise<number | undefined> {
+    const db = await this.query();
+    const row = await db.get("SELECT evidence_at FROM memory_evidence_times WHERE memory_id = ?", id) as { evidence_at?: number } | null;
+    return row?.evidence_at;
+  }
+
+  async recordEvidenceTime(id: string, at: number | undefined): Promise<void> {
+    if (at === undefined) return;
+    const db = await this.query();
+    await db.run(`INSERT INTO memory_evidence_times (memory_id, evidence_at) VALUES (?, ?)
+      ON CONFLICT(memory_id) DO UPDATE SET evidence_at = excluded.evidence_at`, id, at);
+  }
+
   async findNearest(vector: Float32Array, limit = 1): Promise<NearestMemory[]> {
-    const db = await this.connection();
+    const db = await this.query();
     const json = JSON.stringify(Array.from(vector));
     const rows = (await db.all(
-      `SELECT id, title, content, source,
+      `SELECT id, version, title, content, source,
+              CASE WHEN ${AVAILABLE_MEMORY} THEN 1 ELSE 0 END AS available,
               1 - vector_distance_cos(vector, vector32(?)) AS similarity
        FROM memories
        WHERE status = 'active'
@@ -524,6 +643,8 @@ export class MemoryStore {
     )) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: String(row.id),
+      version: Number(row.version),
+      available: Number(row.available) === 1,
       title: String(row.title),
       content: String(row.content),
       source: String(row.source) as MemorySource,
@@ -532,16 +653,17 @@ export class MemoryStore {
   }
 
   /** Keyword + vector hybrid search over active memories. */
-  async search(query: string, vector: Float32Array, limit: number): Promise<MemorySearchHit[]> {
+  async search(query: string, vector: Float32Array, limit: number, includeConflicts = false): Promise<MemorySearchHit[]> {
     const db = await this.connection();
     const json = JSON.stringify(Array.from(vector));
+    const active = includeConflicts ? "status = 'active'" : AVAILABLE_MEMORY;
     const candidateLimit = Math.max(limit * 3, 20);
     const candidates = new Map<string, { similarity: number; keyword: number }>();
 
     const vectorRows = (await db.all(
       `SELECT id, 1 - vector_distance_cos(vector, vector32(?)) AS similarity
        FROM memories
-       WHERE status = 'active'
+       WHERE ${active}
        ORDER BY vector_distance_cos(vector, vector32(?)) ASC
        LIMIT ?`,
       json,
@@ -562,7 +684,7 @@ export class MemoryStore {
         const pattern = `%${escapeLike(token)}%`;
         const rows = (await db.all(
           `SELECT id FROM memories
-           WHERE status = 'active'
+           WHERE ${active}
              AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR related_files LIKE ? ESCAPE '\\')
            LIMIT ?`,
           pattern,
@@ -589,7 +711,7 @@ export class MemoryStore {
     const rows = (await db.all(
       `SELECT *, 1 - vector_distance_cos(vector, vector32(?)) AS similarity
        FROM memories
-       WHERE status = 'active' AND id IN (${placeholders})`,
+       WHERE ${active} AND id IN (${placeholders})`,
       json,
       ...ids
     )) as Array<Record<string, unknown>>;
@@ -611,7 +733,7 @@ export class MemoryStore {
     const db = await this.connection();
     const rows = (await db.all(
       `SELECT id, category, title FROM memories
-       WHERE status = 'active'
+       WHERE ${AVAILABLE_MEMORY}
        ORDER BY updated_at DESC
        LIMIT ?`,
       limit
@@ -634,7 +756,7 @@ export class MemoryStore {
   async listActive(): Promise<MemoryRecord[]> {
     const db = await this.connection();
     const rows = (await db.all(
-      "SELECT * FROM memories WHERE status = 'active' ORDER BY updated_at DESC"
+      `SELECT * FROM memories WHERE ${AVAILABLE_MEMORY} ORDER BY updated_at DESC`
     )) as Array<Record<string, unknown>>;
     return rows.map(rowToRecord);
   }
