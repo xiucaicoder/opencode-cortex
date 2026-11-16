@@ -91,6 +91,10 @@ When a session becomes idle, the plugin reads new conversation content and attem
 - The extraction prompt requires Chinese output, with `category` using the four English enum values.
 - With `autoCaptureDryRun: true`, candidates are appended to `<storagePath>/dry-run.jsonl` (default `~/.opencode-cortex/dry-run.jsonl`) instead of being written as memories. The file contains session IDs, timestamps, actions, and redacted fields. The session watermark still advances to avoid recapturing the same increment.
 
+## List memories
+
+Run `cortex list` in the target project to inspect available memories, `cortex list --conflicts` for pending conflicts, or `cortex list --all` to include archived and conflict-blocked entries. The installed command requires Bun.
+
 ## Configuration
 
 Global configuration: `~/.config/opencode/opencode-cortex.jsonc`  

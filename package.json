@@ -60,5 +60,8 @@
   ],
   "peerDependencies": {
     "@opencode/plugin": "^2.0.0"
+  },
+  "bin": {
+    "cortex": "scripts/cortex.js"
   }
 }

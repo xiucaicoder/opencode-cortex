@@ -95,6 +95,10 @@
 
 二次核验使用同一配置的模型。上线前可用实际模型运行下方回放，核对业务正确率。
 
+## 查看记忆
+
+在目标项目目录运行 `cortex list` 查看可用记忆，`cortex list --conflicts` 查看待处理冲突，`cortex list --all` 包含归档及被冲突屏蔽的条目。命令需要 Bun，安装本包后提供 `cortex`。
+
 ## 配置
 
 全局配置：`~/.config/opencode/opencode-cortex.jsonc`  
