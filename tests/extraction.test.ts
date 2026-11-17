@@ -811,6 +811,87 @@ describe("auto extraction", () => {
     }
   });
 
+  it("resumes by timestamp when compaction removed the watermark message", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const config = {
+        ...runtime.config,
+        autoExtract: { ...runtime.config.autoExtract, minInputChars: 1, cooldownMinutes: 0 },
+      };
+      await runtime.service.setSessionState("s1", "old-mid", 1000);
+      const compacted: RawSessionMessage[] = [
+        { id: "summary", type: "assistant", text: "此前对话已压缩：退款规则已记录。", time: { created: 500 } },
+        { id: "new1", type: "user", text: "只有取消成功的订单才回补库存", time: { created: 2000 } },
+      ];
+      let prompt = "";
+      const outcome = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: async (value) => {
+          prompt = value;
+          return "[]";
+        },
+        verify,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => compacted,
+        now: () => 1_000_000,
+      });
+      expect(outcome.status).toBe("ok");
+      expect(prompt).toContain("只有取消成功的订单才回补库存");
+      expect(prompt).not.toContain("此前对话已压缩");
+      expect((await runtime.service.getSessionState("s1")).last_extracted_message_id).toBe("new1");
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("skips instead of reprocessing when the watermark is lost without an anchor", async () => {
+    const runtime = createTestRuntime();
+    try {
+      const config = {
+        ...runtime.config,
+        autoExtract: { ...runtime.config.autoExtract, maxMessages: 1, minInputChars: 1, cooldownMinutes: 0 },
+      };
+      let calls = 0;
+      const first = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: async () => {
+          calls++;
+          return "[]";
+        },
+        verify,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => [
+          { id: "m1", type: "user", text: "背景".repeat(30), time: { created: 1 } },
+          { id: "m2", type: "user", text: "只有取消成功的订单才回补库存", time: { created: 2 } },
+        ],
+        now: () => 1_000_000,
+      });
+      expect(first.status).toBe("ok");
+      const state = await runtime.service.getSessionState("s1");
+      expect(state.last_extracted_message_id).toBe("m1");
+      expect(state.last_extracted_at).toBeNull();
+
+      // Compaction removed m1 and no committed timestamp exists to anchor on.
+      const after = await runAutoExtraction("s1", config, {
+        service: runtime.service,
+        generate: async () => {
+          calls++;
+          return "[]";
+        },
+        verify,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => [
+          { id: "m2", type: "user", text: "只有取消成功的订单才回补库存", time: { created: 2 } },
+        ],
+        now: () => 1_000_001,
+      });
+      expect(after).toMatchObject({ status: "skipped", reason: "watermark_lost" });
+      expect(calls).toBe(1);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
   it("allows only one concurrent run to commit the same checkpoint", async () => {
     const runtime = createTestRuntime();
     const config = { ...runtime.config, autoExtract: { ...runtime.config.autoExtract, minInputChars: 1 } };

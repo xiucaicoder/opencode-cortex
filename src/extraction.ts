@@ -108,10 +108,25 @@ function buildIncrement(
   messages: ExtractMessage[],
   cursor: ExtractionCursor,
   limits: Pick<CortexConfig["autoExtract"], "maxMessages" | "maxAssistantChars" | "maxInputChars">,
-  redact: (text: string) => string
+  redact: (text: string) => string,
+  fallbackAfter: number | null = null
 ): Increment | null {
   const previous = messages.findIndex((message) => message.id === cursor.messageId);
-  const start = previous < 0 ? 0 : previous + (cursor.offset === 0 ? 1 : 0);
+  let start: number;
+  if (previous >= 0) {
+    start = previous + (cursor.offset === 0 ? 1 : 0);
+  } else if (cursor.messageId === null) {
+    start = 0;
+  } else if (fallbackAfter !== null) {
+    // Compaction removed the watermark message. Resume from the first
+    // message created after the last committed extraction instead of
+    // reprocessing the whole transcript.
+    const firstAfter = messages.findIndex((message) => message.created > fallbackAfter);
+    start = firstAfter < 0 ? messages.length : firstAfter;
+  } else {
+    // The watermark is lost and no timestamp anchor exists. Never reprocess.
+    return null;
+  }
   if (start === messages.length) return null;
 
   const fragments: ExtractMessage[] = [];
@@ -372,13 +387,27 @@ export async function runAutoExtraction(
       offset: state.last_extracted_offset,
     };
 
+    const allMessages = toExtractMessages(rawMessages);
+    let fallbackAfter: number | null = null;
+    if (cursor.messageId !== null && !allMessages.some((message) => message.id === cursor.messageId)) {
+      // The watermark message is gone (for example after compaction). Fall
+      // back to the last committed extraction time; without an anchor, skip
+      // rather than reprocess the transcript from the start.
+      fallbackAfter = state.last_extracted_at;
+      if (fallbackAfter === null) {
+        log("auto extraction: watermark lost without anchor", { session_id: sessionID });
+        return { status: "skipped", reason: "watermark_lost" };
+      }
+      log("auto extraction: watermark compacted, resuming by timestamp", { session_id: sessionID });
+    }
+
     // Redact with the same rules used by the write path before any truncation,
     // so a secret split by a slice boundary cannot leak. Only counts and rule
     // names may be logged.
     let redactionHits = 0;
     const redactionRules = new Set<string>();
     const increment = buildIncrement(
-      toExtractMessages(rawMessages),
+      allMessages,
       cursor,
       config.autoExtract,
       (text) => {
@@ -386,7 +415,8 @@ export async function runAutoExtraction(
         redactionHits += result.hits;
         for (const rule of result.rules) redactionRules.add(rule);
         return result.text;
-      }
+      },
+      fallbackAfter
     );
     if (!increment) return { status: "skipped", reason: "no_increment" };
     // A queued tail should be processed even when shorter than the usual
