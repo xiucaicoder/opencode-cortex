@@ -37,6 +37,8 @@ describe("tool registration", () => {
       expect(added.map((tool) => tool.name)).toEqual(["memory_search", "memory_mutate"]);
 
       const mutate = added.find((tool) => tool.name === "memory_mutate")!;
+      expect(String((mutate as unknown as { description: string }).description))
+        .toContain("立即调用本工具并附其原话");
       const addResult = JSON.parse(
         (
           await mutate.execute(

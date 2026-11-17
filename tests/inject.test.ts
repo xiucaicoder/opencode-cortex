@@ -11,6 +11,7 @@ describe("memory context injection", () => {
   it("includes the prefix, overview and title directory without bodies", () => {
     const text = buildInjectionText("系统边界说明", titles.slice(0, 2));
     expect(text.startsWith(INJECTION_PREFIX)).toBe(true);
+    expect(INJECTION_PREFIX).toContain("立即调用 memory_mutate 并附其原话");
     expect(text).toContain("## 项目概览\n系统边界说明");
     expect(text).toContain("[id-0] [domain_rule] 规则 0");
     expect(text).toContain("[id-1] [domain_rule] 规则 1");

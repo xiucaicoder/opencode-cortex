@@ -124,7 +124,7 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService, 
       name: "memory_mutate",
       options: { codemode: true, pinned: true },
       description:
-        "写入项目记忆。仅在开发者明确确认了新的业务规则、架构决策、数据约束或踩坑结论后调用；AI 自己的推测、未验证方案和调试过程不要写入。修改已有条目之前先调用 memory_search 获取 id 和 version，update/delete 必须带 id 和 version。content 最多 200 字，category 必须是四类之一；必须提供当前开发者消息中的证据。仅在证据明确替代原规则时用 update。",
+        "写入项目记忆。仅在开发者明确确认了新的业务规则、架构决策、数据约束或踩坑结论后调用；AI 自己的推测、未验证方案和调试过程不要写入。开发者明确陈述新业务规则或纠正你时，立即调用本工具并附其原话。修改已有条目之前先调用 memory_search 获取 id 和 version，update/delete 必须带 id 和 version。content 最多 200 字，category 必须是四类之一；必须提供当前开发者消息中的证据。仅在证据明确替代原规则时用 update。",
       input: MUTATE_INPUT as unknown as never,
       execute: async (args: MutateInput & { evidence_quote?: string }, context) => {
         try {
