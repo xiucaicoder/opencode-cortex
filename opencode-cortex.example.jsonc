@@ -23,6 +23,10 @@
   // 开启后自动提取只写 <storagePath>/dry-run.jsonl，不写记忆库
   "autoCaptureDryRun": false,
 
+  // 诊断：开启后把脱敏后的模型原始输出写入 <storagePath>/debug-capture.jsonl
+  // 文件权限 0600，只保留 3 天（自动清理），用于定位提取/核验问题
+  "debugCapture": false,
+
   // 可选数据库加密；启用后未配置 key 时自动生成到 <storagePath>/db.key
   "databaseEncryptionEnabled": false,
   // "databaseEncryptionKey": "64 位十六进制字符，只能放全局配置",

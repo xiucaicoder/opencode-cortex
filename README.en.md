@@ -113,6 +113,7 @@ See [`opencode-cortex.example.jsonc`](./opencode-cortex.example.jsonc) for an ex
 | `dedupRelatedLimit` | `3` | Maximum related entries returned after a write |
 | `blockedPatterns` | `[]` | Additional sensitive-information regular expressions |
 | `autoCaptureDryRun` | `false` | Write candidates to `dry-run.jsonl` instead of memories |
+| `debugCapture` | `false` | Append redacted raw model output to `debug-capture.jsonl` (0600 permissions, three-day retention) |
 | `databaseEncryptionEnabled` | `false` | Enable optional Turso encryption |
 | `databaseEncryptionKey` | Auto-generated | 64-character hexadecimal AES-256 key; global configuration only |
 | `opencodeProvider` | `opencode-go` | Extraction model provider; parsed from `opencodeModel` when it contains `/` |

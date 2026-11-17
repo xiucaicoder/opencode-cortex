@@ -1,9 +1,11 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "@tursodatabase/database";
 import { runAutoExtraction, parseExtractionItems, type RawSessionMessage } from "../src/extraction.js";
 import { createEvidenceVerifier, type VerifyEvidence } from "../src/evidence.js";
+import { setLogFile } from "../src/logger.js";
 import { MemoryStore } from "../src/store.js";
 import { createSecondService, createTestRuntime } from "./helpers.js";
 
@@ -787,6 +789,41 @@ describe("auto extraction", () => {
       expect(outcomes.map((outcome) => outcome.status).sort()).toEqual(["ok", "skipped"]);
       expect(await runtime.service.listActive()).toHaveLength(1);
     } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("logs stage timings and evidence rejection reason codes", async () => {
+    const runtime = createTestRuntime();
+    const dir = mkdtempSync(join(tmpdir(), "cortex-diag-"));
+    setLogFile(join(dir, "diag.log"));
+    try {
+      const config = { ...runtime.config, autoExtract: { ...runtime.config.autoExtract, minInputChars: 1 } };
+      const outcome = await runAutoExtraction("diag", config, {
+        service: runtime.service,
+        generate: async () => JSON.stringify([
+          refund,
+          { ...refund, title: "指向助手", evidence_index: 2, evidence_quote: "已记录，退款超过 500 元需要财务审核。" },
+          { ...refund, title: "越界", evidence_index: 9, evidence_quote: refund.evidence_quote },
+        ]),
+        verify,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => messages,
+      });
+      expect(outcome.added).toBe(1);
+      const lines = readFileSync(join(dir, "diag.log"), "utf-8");
+      const finished = lines.split("\n").find((line) => line.includes("auto extraction: finished"));
+      expect(finished).toContain("stages");
+      expect(finished).toMatch(/search_ms/);
+      expect(finished).toMatch(/generate_ms/);
+      expect(finished).toMatch(/verify_ms/);
+      expect(finished).toMatch(/write_ms/);
+      expect(finished).toContain("evidence_role");
+      expect(finished).toContain("evidence_index");
+      expect(lines).not.toContain(refund.evidence_quote);
+    } finally {
+      setLogFile(join(tmpdir(), "cortex-diag-restore.log"));
+      rmSync(dir, { recursive: true, force: true });
       await runtime.cleanup();
     }
   });

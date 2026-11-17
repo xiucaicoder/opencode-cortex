@@ -65,6 +65,7 @@ export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRu
     dedupRelatedLimit: 3,
     blockedPatterns: [],
     autoCaptureDryRun: false,
+    debugCapture: false,
     opencodeProvider: "opencode-go",
     opencodeModel: "opencode-go/glm-5.3-flash",
     opencodeVariant: "low",

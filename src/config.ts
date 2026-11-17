@@ -37,6 +37,8 @@ export interface CortexConfig {
   blockedPatterns: string[];
   /** Capture extraction output to dry-run.jsonl instead of writing memories. */
   autoCaptureDryRun: boolean;
+  /** Append redacted raw model output to debug-capture.jsonl for diagnosis. */
+  debugCapture: boolean;
   /** Provider id used by automatic extraction. */
   opencodeProvider: string;
   /** Model ref used by automatic extraction; "inherit" follows the host default. */
@@ -77,6 +79,7 @@ const DEFAULTS: CortexConfig = {
   dedupRelatedLimit: 3,
   blockedPatterns: [],
   autoCaptureDryRun: false,
+  debugCapture: false,
   opencodeProvider: "opencode-go",
   opencodeModel: "opencode-go/glm-5.3-flash",
   opencodeVariant: "low",
@@ -226,6 +229,7 @@ export function loadConfig(directory: string): CortexConfig {
         })
       : [],
     autoCaptureDryRun: booleanField(raw, "autoCaptureDryRun", DEFAULTS.autoCaptureDryRun),
+    debugCapture: booleanField(raw, "debugCapture", DEFAULTS.debugCapture),
     opencodeProvider: stringField(raw, "opencodeProvider", DEFAULTS.opencodeProvider),
     opencodeModel: stringField(raw, "opencodeModel", DEFAULTS.opencodeModel),
     ...(typeof raw.opencodeVariant === "string" && raw.opencodeVariant.trim()

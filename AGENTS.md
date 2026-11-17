@@ -39,7 +39,7 @@ bun run scripts/smoke.ts
 - Cosine similarity selects candidates. Evidence review distinguishes equivalent and distinct rules. Store unresolved candidates atomically with progress. Hide affected versions from normal retrieval only when there is evidence of a contradiction.
 - The database stores embedding model, dimensions, dtype and pooling. Mismatch must fail loudly; never re-embed or migrate silently.
 - No legacy schema, shard, DiskANN or opencode-mem migration code.
-- Never log memory content, secret matches or full request bodies. Logs may include ids, counts and similarity values only.
+- Never log memory content, secret matches or full request bodies. Logs may include ids, counts, stage timings and similarity values only. `debugCapture: true` (off by default) is the single sanctioned exception: it appends redacted raw model output to `<storagePath>/debug-capture.jsonl` with 0600 permissions and three-day retention.
 - One database per project identity; do not add a global cross-project store.
 - No timers for background work; stage 2/3 run off session events.
 - Injection sends only the ≤500-char overview plus `[id] [category] title` lines (max 150, newest first). Never inject memory bodies.

@@ -3,6 +3,7 @@ import type { MemoryService, MutateInput, MutateResult } from "./memory-service.
 import { MemoryError } from "./memory-service.js";
 import { compatibleEvidence, sessionSourceRef, type VerifyEvidence } from "./evidence.js";
 import { toExtractMessages, type RawSessionMessage } from "./extraction.js";
+import { log } from "./logger.js";
 import { redactSecrets } from "./secrets.js";
 
 interface ToolWriteDeps {
@@ -84,6 +85,14 @@ function errorContent(error: unknown): string {
   });
 }
 
+/** Log the error class of a tool failure. Codes only, never content. */
+function logToolError(tool: string, error: unknown): void {
+  log("memory tool error", {
+    tool,
+    code: error instanceof MemoryError ? error.code : "internal_error",
+  });
+}
+
 export async function registerMemoryTools(ctx: Context, service: MemoryService, deps: ToolWriteDeps): Promise<void> {
   await ctx.tool.transform((editor) => {
     editor.add({
@@ -92,11 +101,20 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService, 
       description:
         "检索本项目已沉淀的业务规则、架构决策、数据约束和踩坑记录。在修改业务逻辑、数据结构或状态流转之前，必须先调用本工具确认既有约束，避免只按代码字面实现而违反业务规则。仅返回可用的 active 条目；需要修改或归档时，使用返回的 id 和 version。",
       input: SEARCH_INPUT as unknown as never,
-      execute: async (args: { query?: string; limit?: number }) => {
+      execute: async (args: { query?: string; limit?: number }, context) => {
+        const started = Date.now();
         try {
           const hits = await service.search(args.query ?? "", args.limit ?? 5);
+          log("memory search", {
+            session_id: context.sessionID,
+            query_chars: (args.query ?? "").length,
+            limit: args.limit ?? 5,
+            hits: hits.length,
+            ms: Date.now() - started,
+          });
           return { content: JSON.stringify(hits) };
         } catch (error) {
+          logToolError("memory_search", error);
           return { content: errorContent(error) };
         }
       },
@@ -164,6 +182,7 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService, 
           deps.onWrite();
           return { content: JSON.stringify(result) };
         } catch (error) {
+          logToolError("memory_mutate", error);
           if (error instanceof MemoryError && error.code === "possible_conflict") deps.onWrite();
           return { content: errorContent(error) };
         }

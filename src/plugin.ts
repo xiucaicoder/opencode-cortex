@@ -6,6 +6,7 @@ import { log } from "./logger.js";
 import { buildInjectionText, InjectionCache } from "./inject.js";
 import { runAutoExtraction, type RawSessionMessage } from "./extraction.js";
 import { createRuntime } from "./runtime.js";
+import { captureModelOutput } from "./debug-capture.js";
 import { createDecisionVerifier, createEvidenceVerifier, type VerifyEvidence } from "./evidence.js";
 import { registerMemoryTools } from "./tools.js";
 
@@ -87,10 +88,20 @@ const OpenCodeCortexPlugin: Plugin = {
       );
       return response.text;
     };
+    // debugCapture appends the redacted raw model output of extraction and
+    // verification calls to a 0600 file with three-day retention. No-op when
+    // the option is off (the default).
+    const withCapture =
+      (kind: "extract" | "verify") =>
+      async (prompt: string): Promise<string> => {
+        const text = await generate(prompt);
+        captureModelOutput(config, kind, text);
+        return text;
+      };
     const getMessages = async (sessionID: string): Promise<RawSessionMessage[]> =>
       (await ctx.session.context({ sessionID })) as unknown as RawSessionMessage[];
 
-    const verifyText = createEvidenceVerifier(generate);
+    const verifyText = createEvidenceVerifier(withCapture("verify"));
     const verifyDecisions = createDecisionVerifier(async (input, questions) => {
       const model = await resolveModelRef(ctx, config);
       const result = await ctx.experimental.generate.decisions(
@@ -127,7 +138,7 @@ const OpenCodeCortexPlugin: Plugin = {
           log("auto extraction: idle received", { session_id: event.sessionID });
           const outcome = await runAutoExtraction(event.sessionID, config, {
             service,
-            generate,
+            generate: withCapture("extract"),
             verify,
             readPrompt: readExtractionPrompt,
             getMessages,

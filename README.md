@@ -119,6 +119,7 @@
 | `dedupRelatedLimit` | `3` | 写入成功后最多返回的相似条目数 |
 | `blockedPatterns` | `[]` | 额外敏感信息正则 |
 | `autoCaptureDryRun` | `false` | 只写 `dry-run.jsonl`，不写记忆条目 |
+| `debugCapture` | `false` | 把脱敏后的模型原始输出写入 `debug-capture.jsonl`（权限 0600，保留 3 天） |
 | `databaseEncryptionEnabled` | `false` | 可选 Turso 加密 |
 | `databaseEncryptionKey` | 自动生成 | 64 位十六进制 AES-256 密钥，仅限全局配置 |
 | `opencodeProvider` | `opencode-go` | 提取模型 provider；`opencodeModel` 含 `/` 时由该值解析 |

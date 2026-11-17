@@ -236,19 +236,46 @@ async function groundItems(
   sessionID: string,
   verify: VerifyEvidence,
   blockedPatterns: string[]
-): Promise<AutoMutation[]> {
+): Promise<{ items: AutoMutation[]; rejected: Record<string, number> }> {
   const existing = new Map(oldMemories.map((item) => [item.id, item]));
+  const rejected: Record<string, number> = {};
+  const reject = (reason: string): void => {
+    rejected[reason] = (rejected[reason] ?? 0) + 1;
+  };
   const candidates: Array<{ item: AutoMutation; review: EvidenceReview }> = [];
   for (const { evidence_index, evidence_quote, ...item } of items) {
     const evidence = messages[evidence_index - 1];
-    if (evidence?.role !== "user" || evidence_quote.includes("[REDACTED]") ||
-        !evidence.text.includes(evidence_quote) ||
-        !compatibleEvidence(item.content, evidence_quote)) continue;
+    if (!evidence) {
+      reject("evidence_index");
+      continue;
+    }
+    if (evidence.role !== "user") {
+      reject("evidence_role");
+      continue;
+    }
+    if (evidence_quote.includes("[REDACTED]")) {
+      reject("evidence_redacted");
+      continue;
+    }
+    if (!evidence.text.includes(evidence_quote)) {
+      reject("evidence_quote");
+      continue;
+    }
+    if (!compatibleEvidence(item.content, evidence_quote)) {
+      reject("evidence_incompatible");
+      continue;
+    }
     const containsBlockedText = [item.title, item.content, ...item.related_files]
       .some((text) => redactSecrets(text, blockedPatterns).hits > 0);
-    if (containsBlockedText) continue;
+    if (containsBlockedText) {
+      reject("blocked_secret");
+      continue;
+    }
     const previous = item.id ? existing.get(item.id) : undefined;
-    if (item.action === "update" && !previous) continue;
+    if (item.action === "update" && !previous) {
+      reject("update_unknown_id");
+      continue;
+    }
     candidates.push({
       item: {
         ...item,
@@ -269,15 +296,23 @@ async function groundItems(
       },
     });
   }
-  if (!candidates.length) return [];
+  if (!candidates.length) return { items: [], rejected };
   const decisions = await verify(candidates.map(({ review }) => review));
   if (decisions.length !== candidates.length) throw new Error("核验结果数量不符");
   const updates = new Set<string>();
-  return candidates.flatMap(({ item }, index) => {
+  const grounded: AutoMutation[] = [];
+  for (const [index, { item }] of candidates.entries()) {
     const decision = decisions[index];
-    if (!decision?.supported || (item.id && updates.has(item.id))) return [];
+    if (!decision?.supported) {
+      reject("verify_rejected");
+      continue;
+    }
+    if (item.id && updates.has(item.id)) {
+      reject("duplicate_update");
+      continue;
+    }
     if (item.id) updates.add(item.id);
-    return [{
+    grounded.push({
       ...item,
       comparisons: oldMemories.flatMap(({ id, version }) => {
         const relation = decision.conflicts_with?.includes(id) ? "conflict"
@@ -285,8 +320,9 @@ async function groundItems(
           : decision.distinct_from?.includes(id) ? "distinct" : undefined;
         return relation ? [{ id, version, relation }] : [];
       }),
-    }];
-  });
+    });
+  }
+  return { items: grounded, rejected };
 }
 
 export interface ExtractionDeps {
@@ -377,6 +413,23 @@ export async function runAutoExtraction(
       });
     }
 
+    // Diagnostics: per-stage timings and evidence rejection reason codes.
+    // Only durations and counts are recorded, never conversation content.
+    const stageMs: Record<string, number> = {};
+    let rejected: Record<string, number> = {};
+    const timed = async <T>(stage: string, run: () => Promise<T>): Promise<T> => {
+      const start = Date.now();
+      try {
+        return await run();
+      } finally {
+        stageMs[`${stage}_ms`] = Date.now() - start;
+      }
+    };
+    const diag = (): Record<string, unknown> => ({
+      ...(Object.keys(stageMs).length > 0 ? { stages: stageMs } : {}),
+      ...(Object.keys(rejected).length > 0 ? { rejected } : {}),
+    });
+
     const failBatch = async (reason: string): Promise<ExtractionOutcome> => {
       const attempts = await deps.service.recordExtractionFailure(
         sessionID,
@@ -385,13 +438,13 @@ export async function runAutoExtraction(
         now
       );
       if (attempts === undefined) return { status: "skipped", reason: "progress_changed" };
-      log("auto extraction: batch retained", { reason, attempts });
+      log("auto extraction: batch retained", { reason, attempts, ...diag() });
       return { status: "failed", reason, attempts };
     };
 
     let oldMemories: MemoryHit[];
     try {
-      oldMemories = await deps.service.search(increment.queryText, 5, true);
+      oldMemories = await timed("search", () => deps.service.search(increment.queryText, 5, true));
     } catch {
       return await failBatch("retrieval");
     }
@@ -405,8 +458,8 @@ export async function runAutoExtraction(
 
     let output: string;
     try {
-      output = await deps.generate(
-        buildExtractionPrompt(basePrompt, oldMemories, increment.inputText)
+      output = await timed("generate", () =>
+        deps.generate(buildExtractionPrompt(basePrompt, oldMemories, increment.inputText))
       );
     } catch {
       return await failBatch("generate");
@@ -414,31 +467,41 @@ export async function runAutoExtraction(
 
     let parsed: { items: ExtractItem[]; skipped: number };
     try {
-      parsed = parseExtractionItems(output, config.autoExtract.maxItems);
+      parsed = await timed("parse", async () =>
+        parseExtractionItems(output, config.autoExtract.maxItems)
+      );
     } catch {
       return await failBatch("parse");
     }
 
-    let items: AutoMutation[];
+    let grounded: { items: AutoMutation[]; rejected: Record<string, number> };
     try {
-      items = await groundItems(parsed.items, increment.messages, oldMemories, sessionID, deps.verify, config.blockedPatterns);
+      grounded = await timed("verify", () =>
+        groundItems(parsed.items, increment.messages, oldMemories, sessionID, deps.verify, config.blockedPatterns)
+      );
     } catch {
       return await failBatch("verify");
     }
+    rejected = grounded.rejected;
+    const items = grounded.items;
     const skipped = parsed.skipped + parsed.items.length - items.length;
     try {
       if (config.autoCaptureDryRun) {
         const captured = appendDryRun(config, sessionID, items, now);
-        const applied = await deps.service.applyExtractionBatch(sessionID, cursor, increment.next, completedAt, []);
+        const applied = await timed("write", () =>
+          deps.service.applyExtractionBatch(sessionID, cursor, increment.next, completedAt, [])
+        );
         if (!applied) return { status: "skipped", reason: "progress_changed" };
-        log("auto extraction: dry run captured", { captured, skipped });
+        log("auto extraction: dry run captured", { captured, skipped, ...diag() });
         return { status: "ok", added: 0, updated: 0, skippedItems: skipped, dryRun: true, captured };
       }
-      const applied = await deps.service.applyExtractionBatch(sessionID, cursor, increment.next, completedAt, items);
+      const applied = await timed("write", () =>
+        deps.service.applyExtractionBatch(sessionID, cursor, increment.next, completedAt, items)
+      );
       if (!applied) return { status: "skipped", reason: "progress_changed" };
       const { added, updated, conflicts } = applied;
       const skippedItems = skipped + applied.skipped;
-      log("auto extraction: finished", { added, updated, conflicts, skipped: skippedItems });
+      log("auto extraction: finished", { added, updated, conflicts, skipped: skippedItems, ...diag() });
       return { status: "ok", added, updated, conflicts, skippedItems };
     } catch {
       return await failBatch("write");

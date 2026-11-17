@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { registerMemoryTools } from "../src/tools.js";
 import { createTestRuntime } from "./helpers.js";
@@ -79,6 +81,15 @@ describe("tool registration", () => {
       ) as { success: boolean; code: string };
       expect(invalid.success).toBe(false);
       expect(invalid.code).toBe("content_too_long");
+
+      const logText = readFileSync(
+        join(dirname(runtime.config.storagePath), "test.log"),
+        "utf-8"
+      );
+      expect(logText).toContain("memory search");
+      expect(logText).toMatch(/"hits":1/);
+      expect(logText).toContain("memory tool error");
+      expect(logText).toContain("unverified_evidence");
     } finally {
       await runtime.cleanup();
     }
