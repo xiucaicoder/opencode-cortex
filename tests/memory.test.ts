@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { connect } from "@tursodatabase/database";
 import { MemoryError } from "../src/memory-service.js";
 import { createSecondService, createTestRuntime } from "./helpers.js";
 
@@ -377,6 +378,60 @@ describe("versioned updates", () => {
         })
       );
       expect(updateError.code).toBe("archived");
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+});
+
+describe("database busy handling", () => {
+  it("surfaces a database_busy code after a short backoff retry", async () => {
+    const runtime = createTestRuntime({}, { busyTimeoutMs: 100, busyRetryDelayMs: 50 });
+    try {
+      await runtime.service.listActive();
+      const lock = await connect(runtime.dbPath, { experimental: ["encryption", "multiprocess_wal"] });
+      try {
+        await lock.exec("BEGIN IMMEDIATE");
+        const started = Date.now();
+        const error = await catchError(
+          runtime.service.mutateVerified({
+            action: "add",
+            title: "锁测试",
+            category: "domain_rule",
+            content: "写锁被占用时的写入测试。",
+            source_ref: "test:lock",
+          })
+        );
+        expect(error.code).toBe("database_busy");
+        expect(Date.now() - started).toBeLessThan(5000);
+      } finally {
+        await lock.exec("ROLLBACK");
+        await lock.close();
+      }
+      expect(await runtime.service.listActive()).toHaveLength(0);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
+  it("recovers when the lock clears during the backoff", async () => {
+    const runtime = createTestRuntime({}, { busyTimeoutMs: 100, busyRetryDelayMs: 150 });
+    try {
+      await runtime.service.listActive();
+      const lock = await connect(runtime.dbPath, { experimental: ["encryption", "multiprocess_wal"] });
+      await lock.exec("BEGIN IMMEDIATE");
+      setTimeout(() => {
+        void lock.exec("ROLLBACK").then(() => lock.close()).catch(() => {});
+      }, 120);
+      const result = await runtime.service.mutateVerified({
+        action: "add",
+        title: "恢复测试",
+        category: "domain_rule",
+        content: "锁释放后重试成功。",
+        source_ref: "test:recovery",
+      });
+      expect(result.success).toBe(true);
+      expect(await runtime.service.listActive()).toHaveLength(1);
     } finally {
       await runtime.cleanup();
     }

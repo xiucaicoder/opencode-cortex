@@ -6,7 +6,7 @@ import type { Embedder } from "../src/embedding.js";
 import { setLogFile } from "../src/logger.js";
 import { MemoryService } from "../src/memory-service.js";
 import { resolveProject } from "../src/project.js";
-import { MemoryStore } from "../src/store.js";
+import { MemoryStore, type StoreOptions } from "../src/store.js";
 
 export const DIMS = 768;
 
@@ -50,7 +50,10 @@ export interface TestRuntime {
   cleanup: () => Promise<void>;
 }
 
-export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRuntime {
+export function createTestRuntime(
+  overrides: Partial<CortexConfig> = {},
+  storeOverrides: Partial<StoreOptions> = {}
+): TestRuntime {
   const dir = mkdtempSync(join(tmpdir(), "opencode-cortex-test-"));
   const storagePath = join(dir, "store");
   const config: CortexConfig = {
@@ -94,6 +97,7 @@ export function createTestRuntime(overrides: Partial<CortexConfig> = {}): TestRu
     dtype: config.embeddingDtype,
     pooling: "cls",
     encryption: null,
+    ...storeOverrides,
   });
   const embedder = new FakeEmbedder();
   const service = new MemoryService(config, project, store, embedder);

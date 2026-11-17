@@ -3,6 +3,7 @@ import type { EncryptionOpts } from "@tursodatabase/database-common";
 import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { MemoryError } from "./errors.js";
 import { log } from "./logger.js";
 
 export const CATEGORIES = [
@@ -54,6 +55,10 @@ export interface StoreOptions {
   dtype: string;
   pooling: string;
   encryption?: EncryptionOpts | null;
+  /** Busy timeout per write attempt. Defaults to 2000 ms. */
+  busyTimeoutMs?: number;
+  /** Backoff before the single retry after a busy timeout. Defaults to 250 ms. */
+  busyRetryDelayMs?: number;
 }
 
 export interface ExtractionCursor {
@@ -105,6 +110,14 @@ function rowToRecord(row: Record<string, unknown>): MemoryRecord {
 
 function escapeLike(token: string): string {
   return token.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
+function isBusyError(error: unknown): boolean {
+  return /locked|busy/i.test(error instanceof Error ? error.message : String(error));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function tokenize(text: string): string[] {
@@ -162,11 +175,26 @@ export class MemoryStore {
   async inTransaction<T>(fn: (store: MemoryStore) => Promise<T>): Promise<T> {
     if (this.transaction) return fn(this);
     const db = await this.connection();
-    return db.transactionAsync(async (transaction) => {
-      const store = new MemoryStore(this.options);
-      store.transaction = transaction;
-      return fn(store);
-    }).immediate();
+    const attempt = (): Promise<T> =>
+      db.transactionAsync(async (transaction) => {
+        const store = new MemoryStore(this.options);
+        store.transaction = transaction;
+        return fn(store);
+      }).immediate();
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!isBusyError(error)) throw error;
+      await delay(this.options.busyRetryDelayMs ?? 250);
+      try {
+        return await attempt();
+      } catch (retryError) {
+        if (isBusyError(retryError)) {
+          throw new MemoryError("database_busy", "数据库正被占用，请稍后重试");
+        }
+        throw retryError;
+      }
+    }
   }
 
   private async query(): Promise<Database | Transaction> {
@@ -184,7 +212,7 @@ export class MemoryStore {
       const db = await connect(this.options.dbPath, {
         experimental,
         ...(this.options.encryption ? { encryption: this.options.encryption } : {}),
-        timeout: 10_000,
+        timeout: this.options.busyTimeoutMs ?? 2_000,
       });
       await this.initialize(db);
       this.db = db;

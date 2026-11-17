@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { CortexConfig } from "./config.js";
 import type { ProjectInfo } from "./project.js";
 import type { Embedder } from "./embedding.js";
+import { MemoryError } from "./errors.js";
 import { log } from "./logger.js";
 import { findBlockedField } from "./secrets.js";
 import {
@@ -92,16 +93,7 @@ export interface AutoMutation extends VerifiedMutation {
   source_ref: string;
 }
 
-export class MemoryError extends Error {
-  constructor(
-    public readonly code: string,
-    message: string,
-    public readonly details: Record<string, unknown> = {}
-  ) {
-    super(message);
-    this.name = "MemoryError";
-  }
-}
+export { MemoryError };
 
 const MAX_CONTENT_CHARS = 200;
 
