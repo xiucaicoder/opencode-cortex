@@ -155,6 +155,19 @@ bun run scripts/export.ts memories.md --since 2026-01-01 --source manual
 
 Imports use the same length, category, secret-detection, and deduplication checks. Repeated identical imports are skipped. Entries rejected as duplicates are written to `rejected.jsonl` in the current directory with the existing `existing_id` and similarity for manual review.
 
+## Backup and restore
+
+On the first startup of each day the plugin snapshots the current project database to `<storagePath>/backups/` (default `~/.opencode-cortex/backups/`), keeping the newest seven files per project, named `<project hash>-YYYY-MM-DD.db`. Backup failures are logged and never affect the host; backups of encrypted databases stay encrypted.
+
+Restoring is whole-database: every field (including `status`, `version`, `source`, `related_files`) and every stored vector is preserved.
+
+```bash
+# restore into the current project (an existing target needs --force; it is kept as .pre-restore.bak)
+bun run /path/to/opencode-cortex/scripts/restore.ts <backup.db>
+# restore into an explicit path
+bun run /path/to/opencode-cortex/scripts/restore.ts <backup.db> --to <target.db>
+```
+
 ## Installation
 
 Requires [Bun](https://bun.sh). The first memory operation downloads the local embedding model (`Xenova/bge-base-zh-v1.5`, about 113 MB, cached under `<storagePath>/.cache`, only once; the download has no progress indicator).

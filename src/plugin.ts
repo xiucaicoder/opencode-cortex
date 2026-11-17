@@ -60,6 +60,13 @@ const OpenCodeCortexPlugin: Plugin = {
     );
     const pendingReinject = new Set<string>();
 
+    // One lossless database snapshot per project per day, kept for seven
+    // days under <storagePath>/backups. Failures are logged and never
+    // affect the host.
+    void runtime.service.createDailyBackup().catch((error) => {
+      log("memory backup failed", { error: errorMessage(error) });
+    });
+
     await ctx.session.hook("prompt", async (event) => {
       if (config.injectOn === "always") injectionCache.clear(event.sessionID);
     });

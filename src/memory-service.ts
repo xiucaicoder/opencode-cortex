@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
+import { join } from "node:path";
 import type { CortexConfig } from "./config.js";
 import type { ProjectInfo } from "./project.js";
 import type { Embedder } from "./embedding.js";
+import { backupFileName, createDailyBackup as writeDailyBackup } from "./backup.js";
 import { MemoryError } from "./errors.js";
 import { log } from "./logger.js";
 import { findBlockedField } from "./secrets.js";
@@ -238,6 +240,18 @@ export class MemoryService {
   async listConflicts(): Promise<unknown[]> {
     await this.ready();
     return this.store.listConflicts();
+  }
+
+  /**
+   * Best-effort daily snapshot into `<storagePath>/backups`. Returns true when
+   * a new backup file was created; failures propagate and are logged upstream.
+   */
+  async createDailyBackup(now = new Date()): Promise<boolean> {
+    await this.ready();
+    const backupsDir = join(this.config.storagePath, "backups");
+    const created = await writeDailyBackup(this.store, backupsDir, this.project.dbPath, now);
+    if (created) log("memory backup created", { file: backupFileName(this.project.dbPath, now) });
+    return created;
   }
 
   async getActive(id: string): Promise<MemoryHit | undefined> {

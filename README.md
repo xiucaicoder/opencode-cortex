@@ -161,6 +161,19 @@ bun run scripts/export.ts memories.md --since 2026-01-01 --source manual
 
 导入沿用同一套长度、分类、密钥拦截和去重校验；相同内容重复导入会跳过。被去重拒绝的条目会连同已有 `existing_id`、相似度写入当前目录的 `rejected.jsonl`，便于人工合并。
 
+## 备份与恢复
+
+插件每天首次启动时，把当前项目库完整快照到 `<storagePath>/backups/`（默认 `~/.opencode-cortex/backups/`），每个项目保留最近 7 份，文件名为 `<项目hash>-YYYY-MM-DD.db`。备份失败只记日志，不影响使用；加密库的备份保持加密。
+
+恢复是整库级别的，条目的全部字段（含 `status`、`version`、`source`、`related_files`）与向量保持一致：
+
+```bash
+# 恢复到当前项目（目标库已存在时需 --force，原库保留为 .pre-restore.bak）
+bun run /path/to/opencode-cortex/scripts/restore.ts <backup.db>
+# 恢复到指定路径
+bun run /path/to/opencode-cortex/scripts/restore.ts <backup.db> --to <目标库路径>
+```
+
 ## 安装
 
 需要 [Bun](https://bun.sh)。首次使用会自动下载约 113 MB 的本地 embedding 模型（`Xenova/bge-base-zh-v1.5`，缓存在 `<storagePath>/.cache`，仅一次；下载发生在第一次记忆操作时，无进度提示）。

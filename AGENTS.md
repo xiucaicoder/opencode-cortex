@@ -41,6 +41,7 @@ bun run scripts/smoke.ts
 - No legacy schema, shard, DiskANN or opencode-mem migration code.
 - Never log memory content, secret matches or full request bodies. Logs may include ids, counts, stage timings and similarity values only. `debugCapture: true` (off by default) is the single sanctioned exception: it appends redacted raw model output to `<storagePath>/debug-capture.jsonl` with 0600 permissions and three-day retention.
 - One database per project identity; do not add a global cross-project store.
+- A lossless daily snapshot of each project database is written to `<storagePath>/backups` (at most one per day, seven retained per project). Encrypted databases keep their encryption in backups. Restore with `scripts/restore.ts`; backup failures are logged and never affect the host.
 - No timers for background work; stage 2/3 run off session events.
 - Injection sends only the ≤500-char overview plus `[id] [category] title` lines (max 150, newest first). Never inject memory bodies.
 - `injectOn: "first"` caches one block per session; compaction must clear the cache so the next request reloads it.

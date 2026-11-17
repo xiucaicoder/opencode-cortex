@@ -1,7 +1,7 @@
 import { connect, type Database, type Transaction } from "@tursodatabase/database";
 import type { EncryptionOpts } from "@tursodatabase/database-common";
 import { randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { MemoryError } from "./errors.js";
 import { log } from "./logger.js";
@@ -120,6 +120,16 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Every table copied by the encrypted snapshot path, in dependency-free order. */
+const BACKUP_TABLES = [
+  "project_meta",
+  "memories",
+  "session_state",
+  "memory_history",
+  "memory_conflicts",
+  "memory_evidence_times",
+] as const;
+
 function tokenize(text: string): string[] {
   const normalized = text.toLowerCase().trim();
   if (!normalized) return [];
@@ -194,6 +204,50 @@ export class MemoryStore {
         }
         throw retryError;
       }
+    }
+  }
+
+  /**
+   * Write a consistent, lossless snapshot of this database to `path`. The
+   * target must not exist. Unencrypted databases use VACUUM INTO, which
+   * produces a byte-exact single-file copy including WAL content. Encrypted
+   * databases are copied table by table into a fresh database created with
+   * the same key, because VACUUM INTO would strip the encryption.
+   */
+  async snapshotTo(path: string): Promise<void> {
+    const db = await this.query();
+    if (!this.options.encryption) {
+      await db.exec(`VACUUM INTO '${path.replace(/'/g, "''")}'`);
+      return;
+    }
+    const target = new MemoryStore({ ...this.options, dbPath: path });
+    try {
+      const targetDb = await target.connection();
+      await db.exec("BEGIN");
+      try {
+        for (const table of BACKUP_TABLES) {
+          const rows = (await db.all(`SELECT * FROM ${table}`)) as Array<Record<string, unknown>>;
+          await targetDb.exec(`DELETE FROM ${table}`);
+          for (const row of rows) {
+            const columns = Object.keys(row);
+            if (columns.length === 0) continue;
+            await targetDb.run(
+              `INSERT INTO ${table} (${columns.map((column) => `"${column}"`).join(", ")})` +
+                ` VALUES (${columns.map(() => "?").join(", ")})`,
+              ...columns.map((column) => row[column])
+            );
+          }
+        }
+      } finally {
+        await db.exec("ROLLBACK");
+      }
+      // Fold the WAL into the main file so a bare rename leaves a complete
+      // database behind.
+      await targetDb.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } finally {
+      await target.close();
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
     }
   }
 
