@@ -157,12 +157,45 @@ Imports use the same length, category, secret-detection, and deduplication check
 
 ## Installation
 
+Requires [Bun](https://bun.sh). The first memory operation downloads the local embedding model (`Xenova/bge-base-zh-v1.5`, about 113 MB, cached under `<storagePath>/.cache`, only once; the download has no progress indicator).
+
 ```bash
+git clone https://github.com/xiucaicoder/opencode-cortex
+cd opencode-cortex
 bun install
 bun run build
 ```
 
-Load this package in your OpenCode plugin configuration; `dist/plugin.js` is the entry point. The plugin uses the OpenCode v2 plugin API and declares `"opencode": { "type": "plugin" }` in `package.json`.
+Register the **repository root directory** in the `plugins` array of `opencode.json(c)`. The entry must be the directory itself, never the `dist/plugin.js` file — OpenCode silently skips single-file paths. Global install (all projects):
+
+```jsonc title="~/.config/opencode/opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["/absolute/path/to/opencode-cortex"]
+}
+```
+
+Single-project install (relative paths resolve from the config file):
+
+```jsonc title="<project>/.opencode/opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["../../opencode-cortex"]
+}
+```
+
+Restart OpenCode (or run `opencode service restart`) after registering. State business rules in a conversation; they are extracted once the session goes idle, and `cortex list` shows the result.
+
+### Disabling and uninstalling
+
+- Disable automatic extraction with `autoExtract.enabled: false`; disable the plugin entirely by removing its `plugins` entry (or prefixing the id with `-`, e.g. `"-opencode-cortex"`).
+- Uninstall by removing the entry and, if desired, deleting `<storagePath>` (default `~/.opencode-cortex`, holding per-project databases, logs, and the model cache).
+
+### Privacy
+
+- Embeddings run locally; retrieval never sends conversation content to a service.
+- Automatic extraction and evidence verification send **redacted** conversation fragments and candidate rules to `opencodeModel` (default `opencode-go/glm-5.3-flash`). Secrets, tokens, and internal addresses matched by the built-in rules and `blockedPatterns` are replaced with `[REDACTED]` before anything leaves the process. Point `opencodeModel` at a self-hosted or intranet model to keep data inside your network.
+- Databases are not encrypted by default; enable `databaseEncryptionEnabled` for local at-rest encryption.
 
 ## Development
 

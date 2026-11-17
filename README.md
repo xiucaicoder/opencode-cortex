@@ -163,12 +163,45 @@ bun run scripts/export.ts memories.md --since 2026-01-01 --source manual
 
 ## 安装
 
+需要 [Bun](https://bun.sh)。首次使用会自动下载约 113 MB 的本地 embedding 模型（`Xenova/bge-base-zh-v1.5`，缓存在 `<storagePath>/.cache`，仅一次；下载发生在第一次记忆操作时，无进度提示）。
+
 ```bash
+git clone https://github.com/xiucaicoder/opencode-cortex
+cd opencode-cortex
 bun install
 bun run build
 ```
 
-在 OpenCode 的插件配置中加载本包（`dist/plugin.js` 为入口）。插件使用 OpenCode v2 插件 API，`package.json` 已声明 `"opencode": { "type": "plugin" }`。
+在 `opencode.json(c)` 的 `plugins` 数组中注册**仓库根目录**。必须注册目录本身，不能写 `dist/plugin.js` 文件路径——OpenCode 会静默跳过单个文件路径。全局安装（对所有项目生效）：
+
+```jsonc title="~/.config/opencode/opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["/absolute/path/to/opencode-cortex"]
+}
+```
+
+只在单个项目生效（相对路径以该配置文件为基准）：
+
+```jsonc title="<项目>/.opencode/opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["../../opencode-cortex"]
+}
+```
+
+注册后重启 OpenCode（或运行 `opencode service restart`）。在项目里对话并明确陈述业务规则，会话空闲后自动提取；`cortex list` 可以查看结果。
+
+### 禁用与卸载
+
+- 临时禁用自动提取：配置 `autoExtract.enabled: false`；完全禁用插件：删除 `plugins` 数组中的条目（或按官方语法加 `-` 前缀禁用 id `opencode-cortex`）。
+- 卸载：删除 `plugins` 条目后按需删除 `<storagePath>`（默认 `~/.opencode-cortex`，含各项目数据库、日志与模型缓存）。
+
+### 隐私
+
+- Embedding 在本地运行，检索不把对话内容发送到任何服务。
+- 自动提取与证据核验会把**脱敏后**的对话片段和候选规则发送给 `opencodeModel`（默认 `opencode-go/glm-5.3-flash`）。内置与 `blockedPatterns` 命中的密钥、令牌、内网地址等会先替换为 `[REDACTED]` 再发送；配置自托管或内网模型即可让数据不出你的网络。
+- 数据库默认不加密，可开启 `databaseEncryptionEnabled` 做本地静态加密。
 
 ## 开发
 
