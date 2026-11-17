@@ -20,7 +20,7 @@ update 对应 id，content 只写当前规则及适用范围，不要把旧数�
 输出：只输出 JSON 数组，每项
 {action:"add"|"update", id?(update 必填), title(≤20字), category,
  content(≤200字，只写结论和原因), related_files[], evidence_index, evidence_quote}。
-evidence_index 是本批 user 消息的 index，evidence_quote 是该消息 text 中连续的原文。
+evidence_index 是输入列表中该消息所在行的 index（user 和 assistant 行都计入编号，引用必须指向 user 行），evidence_quote 是该行 text 中连续的原文。
 引用需支持正文里的适用范围、关键条件和结论。没有依据的原因或条件不要补写。
 没有值得记的，输出 []。宁缺毋滥。
 

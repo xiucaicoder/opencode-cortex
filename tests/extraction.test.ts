@@ -765,6 +765,52 @@ describe("auto extraction", () => {
     }
   });
 
+  it("accepts evidence across interleaved assistant lines and rejects assistant targets", async () => {
+    const runtime = createTestRuntime();
+    const interleaved: RawSessionMessage[] = [
+      { id: "u1", type: "user", text: "退款金额超过 500 元必须由财务审核", time: { created: 1 } },
+      { id: "a1", type: "assistant", text: "已记录，退款超过 500 元需要财务审核。", time: { created: 2 } },
+      { id: "u2", type: "user", text: "只有取消成功的订单才回补库存", time: { created: 3 } },
+    ];
+    try {
+      const config = { ...runtime.config, autoExtract: { ...runtime.config.autoExtract, minInputChars: 1 } };
+      const outcome = await runAutoExtraction("interleaved", config, {
+        service: runtime.service,
+        generate: async () => JSON.stringify([{
+          ...refund,
+          evidence_index: 3,
+          title: "库存回补时机",
+          content: "只有取消成功的订单才回补库存",
+          evidence_quote: "只有取消成功的订单才回补库存",
+        }]),
+        verify,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => interleaved,
+      });
+      expect(outcome.added).toBe(1);
+      expect((await runtime.service.listActive())[0]?.source_ref)
+        .toBe("opencode-session:interleaved/message:u2");
+
+      // Index 2 is the assistant line: the prompt numbers all lines, but only
+      // user lines may carry evidence.
+      const rejected = await runAutoExtraction("interleaved2", config, {
+        service: runtime.service,
+        generate: async () => JSON.stringify([{
+          ...refund,
+          evidence_index: 2,
+          evidence_quote: "只有取消成功的订单才回补库存",
+        }]),
+        verify,
+        readPrompt: () => "PROMPT",
+        getMessages: async () => interleaved,
+      });
+      expect(rejected.skippedItems).toBe(1);
+      expect(await runtime.service.listActive()).toHaveLength(1);
+    } finally {
+      await runtime.cleanup();
+    }
+  });
+
   it("allows only one concurrent run to commit the same checkpoint", async () => {
     const runtime = createTestRuntime();
     const config = { ...runtime.config, autoExtract: { ...runtime.config.autoExtract, minInputChars: 1 } };
