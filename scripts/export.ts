@@ -6,7 +6,7 @@
  */
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { createRuntime } from "../src/runtime.js";
+import { createReadOnlyRuntime } from "../src/runtime.js";
 import { CATEGORIES, SOURCES, type MemorySource } from "../src/store.js";
 
 function formatDate(epochMs: number): string {
@@ -63,11 +63,11 @@ async function main(): Promise<void> {
     if (output || includeArchived || source || since !== undefined) {
       throw new Error("--conflicts 不与导出参数合用");
     }
-    const { service } = createRuntime(process.cwd());
+    const { store } = createReadOnlyRuntime(process.cwd());
     try {
-      console.log(JSON.stringify(await service.listConflicts(), null, 2));
+      console.log(JSON.stringify(await store?.listConflicts() ?? [], null, 2));
     } finally {
-      await service.close();
+      await store?.close();
     }
     return;
   }
@@ -79,21 +79,21 @@ async function main(): Promise<void> {
     return;
   }
 
-  const runtime = createRuntime(process.cwd());
+  const { project, store } = createReadOnlyRuntime(process.cwd());
   try {
-    const overview = await runtime.service.getOverview();
+    const overview = await store?.getOverview() ?? "";
     const keep = (item: { source: MemorySource; updated_at: number }): boolean =>
       (!source || item.source === source) && (since === undefined || item.updated_at >= since);
-    const active = (await runtime.service.listActive()).filter(keep);
+    const active = (await store?.listActive() ?? []).filter(keep);
     const archived = includeArchived
-      ? (await runtime.service.listArchived()).filter(keep)
+      ? (await store?.listArchived() ?? []).filter(keep)
       : [];
 
     const lines: string[] = [
       "# 项目记忆导出",
       "",
-      `- 项目: ${runtime.project.name}`,
-      `- 路径: ${runtime.project.root}`,
+      `- 项目: ${project.name}`,
+      `- 路径: ${project.root}`,
       `- 导出时间: ${new Date().toISOString()}`,
       "",
       "## 项目概览",
@@ -126,9 +126,10 @@ async function main(): Promise<void> {
 
     const path = resolve(output);
     writeFileSync(path, `${lines.join("\n")}\n`, "utf-8");
+    if (!store) console.log(`项目 ${project.name} 暂无记忆库，已生成空导出。`);
     console.log(`已导出 ${active.length} 条 active 记忆到 ${path}`);
   } finally {
-    await runtime.service.close();
+    await store?.close();
   }
 }
 

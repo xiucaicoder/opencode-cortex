@@ -95,6 +95,8 @@ When a session becomes idle, the plugin reads new conversation content and attem
 
 Run `cortex list` in the target project to inspect available memories, `cortex list --conflicts` for pending conflicts, or `cortex list --all` to include archived and conflict-blocked entries. The installed command requires Bun.
 
+On Windows, `cortex list` and `export.ts` read an existing database while OpenCode is running. If a file lock prevents an import, stop the OpenCode background service that owns the database, then retry.
+
 ## Configuration
 
 Global configuration: `~/.config/opencode/opencode-cortex.jsonc`  

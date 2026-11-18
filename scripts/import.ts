@@ -40,13 +40,21 @@ async function main(): Promise<void> {
     .filter(Boolean);
 
   const rejectedPath = resolve("rejected.jsonl");
-  rmSync(rejectedPath, { force: true });
 
   let inserted = 0;
   let updated = 0;
   let skipped = 0;
   const rejected: Array<Record<string, unknown>> = [];
   try {
+    try {
+      await runtime.service.ready();
+    } catch (error) {
+      if (error instanceof Error && /Locking error|failed locking file|file is locked by another process/i.test(error.message)) {
+        throw new Error("数据库文件正被占用。请先停止占用该数据库的 OpenCode 后台服务，再重新导入。", { cause: error });
+      }
+      throw error;
+    }
+    rmSync(rejectedPath, { force: true });
     for (let index = 0; index < lines.length; index++) {
       const line = lines[index]!;
       let record: LineRecord;

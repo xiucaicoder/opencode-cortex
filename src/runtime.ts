@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, type CortexConfig } from "./config.js";
 import { resolveProject, type ProjectInfo } from "./project.js";
@@ -11,6 +12,25 @@ export interface Runtime {
   config: CortexConfig;
   project: ProjectInfo;
   service: MemoryService;
+}
+
+/** Inspect the existing database without initializing a writer, model or log. */
+export function createReadOnlyRuntime(directory: string): { project: ProjectInfo; store: MemoryStore | null } {
+  const config = loadConfig(directory);
+  const project = resolveProject(directory, config.storagePath);
+  if (!existsSync(project.dbPath)) return { project, store: null };
+  return {
+    project,
+    store: new MemoryStore({
+      dbPath: project.dbPath,
+      dimensions: config.embeddingDimensions,
+      model: config.embeddingModel,
+      dtype: config.embeddingDtype,
+      pooling: EMBEDDING_POOLING,
+      encryption: resolveEncryption(config, { readOnly: true }),
+      readOnly: true,
+    }),
+  };
 }
 
 export function createRuntime(

@@ -14,7 +14,7 @@ function hasExistingDatabase(storagePath: string): boolean {
   }
 }
 
-function ensureKeyFile(storagePath: string): string {
+function ensureKeyFile(storagePath: string, readOnly: boolean): string {
   const keyPath = join(storagePath, "db.key");
   if (existsSync(keyPath)) {
     const value = readFileSync(keyPath, "utf-8").trim();
@@ -24,7 +24,7 @@ function ensureKeyFile(storagePath: string): string {
     return value;
   }
 
-  if (hasExistingDatabase(storagePath)) {
+  if (readOnly || hasExistingDatabase(storagePath)) {
     throw new Error(
       `已存在项目数据库但找不到加密密钥 ${keyPath}。请恢复原密钥，或在确认数据可弃用后删除旧数据库。`
     );
@@ -42,7 +42,7 @@ function ensureKeyFile(storagePath: string): string {
 }
 
 /** Resolve Turso encryption options, generating a key only for a new store. */
-export function resolveEncryption(config: CortexConfig): EncryptionOpts | null {
+export function resolveEncryption(config: CortexConfig, { readOnly = false } = {}): EncryptionOpts | null {
   if (!config.databaseEncryptionEnabled) return null;
 
   const configured = config.databaseEncryptionKey?.trim();
@@ -56,5 +56,5 @@ export function resolveEncryption(config: CortexConfig): EncryptionOpts | null {
   if (!config.databaseEncryptionCipher.startsWith("aes256")) {
     throw new Error("未显式提供 databaseEncryptionKey 时，只支持 aes256 系列 cipher");
   }
-  return { cipher: config.databaseEncryptionCipher, hexkey: ensureKeyFile(config.storagePath) };
+  return { cipher: config.databaseEncryptionCipher, hexkey: ensureKeyFile(config.storagePath, readOnly) };
 }

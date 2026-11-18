@@ -18,7 +18,9 @@ describe("debug capture", () => {
       const raw = readFileSync(path, "utf-8");
       expect(raw).toContain("[REDACTED]");
       expect(raw).not.toContain(secret);
-      expect(statSync(path).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect(statSync(path).mode & 0o777).toBe(0o600);
+      }
       const entry = JSON.parse(raw.trim()) as { kind: string; chars: number };
       expect(entry.kind).toBe("verify");
       expect(entry.chars).toBeGreaterThan(0);
@@ -47,7 +49,9 @@ describe("debug capture", () => {
       sweepDebugCapture(config);
       const kept = readFileSync(path, "utf-8");
       expect(kept).toContain("fresh output");
-      expect(statSync(path).mode & 0o777).toBe(0o600);
+      if (process.platform !== "win32") {
+        expect(statSync(path).mode & 0o777).toBe(0o600);
+      }
     } finally {
       await runtime.cleanup();
     }

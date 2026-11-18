@@ -55,6 +55,7 @@ export interface StoreOptions {
   dtype: string;
   pooling: string;
   encryption?: EncryptionOpts | null;
+  readOnly?: boolean;
   /** Busy timeout per write attempt. Defaults to 2000 ms. */
   busyTimeoutMs?: number;
   /** Backoff before the single retry after a busy timeout. Defaults to 250 ms. */
@@ -74,6 +75,16 @@ export interface SessionState {
   failed_attempts: number;
   failed_at: number | null;
 }
+
+export type MemoryConflict = {
+  memory_id: string;
+  memory_version: number;
+  current_title: string;
+  current_content: string;
+  content: string;
+  source_ref: string;
+  created_at: number;
+} & Record<string, unknown>;
 
 const SCHEMA_VERSION = "1";
 const AVAILABLE_MEMORY = `status = 'active' AND NOT EXISTS (
@@ -168,6 +179,7 @@ export class MemoryStore {
   private db: Database | null = null;
   private opening: Promise<Database> | null = null;
   private transaction: Transaction | null = null;
+  private readOnlySchema?: { hasMeta: boolean; hasConflicts: boolean; hasRecallFlag: boolean };
 
   constructor(private readonly options: StoreOptions) {}
 
@@ -260,15 +272,30 @@ export class MemoryStore {
     if (this.opening) return this.opening;
 
     this.opening = (async () => {
-      mkdirSync(dirname(this.options.dbPath), { recursive: true });
+      if (!this.options.readOnly) mkdirSync(dirname(this.options.dbPath), { recursive: true });
       const experimental: Array<"encryption" | "multiprocess_wal"> = ["encryption"];
       if (process.platform !== "win32") experimental.push("multiprocess_wal");
       const db = await connect(this.options.dbPath, {
         experimental,
+        ...(this.options.readOnly ? { readonly: true, fileMustExist: true } : {}),
         ...(this.options.encryption ? { encryption: this.options.encryption } : {}),
         timeout: this.options.busyTimeoutMs ?? 2_000,
       });
-      await this.initialize(db);
+      try {
+        if (this.options.readOnly) {
+          const tables = new Set((await db.all("SELECT name FROM sqlite_master WHERE type = 'table'")).map(row => row.name));
+          if (!tables.has("memories")) throw new Error("项目数据库没有记忆表");
+          const hasConflicts = tables.has("memory_conflicts");
+          const hasRecallFlag = hasConflicts && (await db.all("PRAGMA table_info(memory_conflicts)"))
+            .some(row => row.name === "blocks_recall");
+          this.readOnlySchema = { hasMeta: tables.has("project_meta"), hasConflicts, hasRecallFlag };
+        } else {
+          await this.initialize(db);
+        }
+      } catch (error) {
+        await db.close();
+        throw error;
+      }
       this.db = db;
       return db;
     })();
@@ -515,7 +542,9 @@ export class MemoryStore {
   }
 
   async getMeta(key: string): Promise<string | null> {
-    return this.getMetaWith(await this.connection(), key);
+    const db = await this.connection();
+    if (this.readOnlySchema?.hasMeta === false) return null;
+    return this.getMetaWith(db, key);
   }
 
   async setMeta(key: string, value: string): Promise<void> {
@@ -688,11 +717,12 @@ export class MemoryStore {
     );
   }
 
-  async listConflicts(): Promise<unknown[]> {
+  async listConflicts(): Promise<MemoryConflict[]> {
     const db = await this.query();
+    if (this.readOnlySchema?.hasConflicts === false) return [];
     return db.all(`SELECT c.*, m.title AS current_title, m.content AS current_content
       FROM memory_conflicts c JOIN memories m ON m.id = c.memory_id AND m.version = c.memory_version
-      WHERE m.status = 'active' ORDER BY c.created_at DESC`);
+      WHERE m.status = 'active' ORDER BY c.created_at DESC`) as Promise<MemoryConflict[]>;
   }
 
   async getEvidenceTime(id: string): Promise<number | undefined> {
@@ -837,8 +867,9 @@ export class MemoryStore {
 
   async listActive(): Promise<MemoryRecord[]> {
     const db = await this.connection();
+    const filter = this.readOnlySchema?.hasRecallFlag === false ? "status = 'active'" : AVAILABLE_MEMORY;
     const rows = (await db.all(
-      `SELECT * FROM memories WHERE ${AVAILABLE_MEMORY} ORDER BY updated_at DESC`
+      `SELECT * FROM memories WHERE ${filter} ORDER BY updated_at DESC`
     )) as Array<Record<string, unknown>>;
     return rows.map(rowToRecord);
   }
@@ -849,5 +880,10 @@ export class MemoryStore {
       "SELECT * FROM memories WHERE status = 'archived' ORDER BY updated_at DESC"
     )) as Array<Record<string, unknown>>;
     return rows.map(rowToRecord);
+  }
+
+  async listAll(): Promise<MemoryRecord[]> {
+    const db = await this.connection();
+    return (await db.all("SELECT * FROM memories ORDER BY updated_at DESC")).map(rowToRecord);
   }
 }

@@ -99,6 +99,8 @@
 
 在目标项目目录运行 `cortex list` 查看可用记忆，`cortex list --conflicts` 查看待处理冲突，`cortex list --all` 包含归档及被冲突屏蔽的条目。命令需要 Bun，安装本包后提供 `cortex`。
 
+Windows 上，`cortex list` 和 `export.ts` 以只读方式访问已有库，可以在 OpenCode 运行时使用。`import.ts` 需要写入；如果数据库被锁定，先停止占用它的 OpenCode 后台服务再导入。
+
 ## 配置
 
 全局配置：`~/.config/opencode/opencode-cortex.jsonc`  
