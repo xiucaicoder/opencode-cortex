@@ -15,6 +15,8 @@
   // 写入成功后返回最近 3 条相似度 >= 0.75 的条目，供宿主 AI 判断是否合并
   "dedupRelatedThreshold": 0.75,
   "dedupRelatedLimit": 3,
+  // memory_search 的最低相关性阈值（0~1），低于此值的低分噪音会被过滤
+  "searchMinScore": 0.35,
 
   // 额外敏感信息正则，命中 title/content/related_files/source_ref 即拒绝写入
   // 自动提取发送给模型前也会用同一组规则把命中片段替换为 [REDACTED]

@@ -55,7 +55,8 @@ const OpenCodeCortexPlugin: Plugin = {
       buildInjectionText(
         await service.getOverview(),
         await service.listTitles(config.injectMaxTitles),
-        config.injectMaxTitles
+        config.injectMaxTitles,
+        await service.listConflictSummaries()
       )
     );
     const pendingReinject = new Set<string>();

@@ -81,10 +81,45 @@ export type MemoryConflict = {
   memory_version: number;
   current_title: string;
   current_content: string;
+  title: string;
+  category: string;
   content: string;
   source_ref: string;
   created_at: number;
+  blocks_recall: number;
 } & Record<string, unknown>;
+
+export interface ConflictSummary {
+  id: string;
+  version: number;
+  title: string;
+  candidateCount: number;
+  blocksRecall: boolean;
+}
+
+export interface MemoryHistoryEntry {
+  memory_id: string;
+  version: number;
+  title: string;
+  category: MemoryCategory;
+  content: string;
+  related_files: string[];
+  source: MemorySource;
+  source_ref: string | null;
+  status: MemoryStatus;
+  updated_at: number;
+}
+
+export interface RecallStats {
+  recallCount: number;
+  lastRecalledAt: number | null;
+}
+
+export interface SearchOptions {
+  includeConflicts?: boolean;
+  minScore?: number;
+  relatedFile?: string;
+}
 
 const SCHEMA_VERSION = "1";
 const AVAILABLE_MEMORY = `status = 'active' AND NOT EXISTS (
@@ -139,21 +174,42 @@ const BACKUP_TABLES = [
   "memory_history",
   "memory_conflicts",
   "memory_evidence_times",
+  "memory_stats",
 ] as const;
 
+function splitCodeIdentifier(raw: string): string[] {
+  const parts: string[] = [];
+  const lower = raw.toLowerCase();
+  if (lower.length >= 2) parts.push(lower);
+  const split = raw
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[\s_\-./\\]+/);
+  for (const part of split) {
+    const token = part.toLowerCase().trim();
+    if (token.length >= 2 && token !== lower) parts.push(token);
+  }
+  return parts;
+}
+
 function tokenize(text: string): string[] {
-  const normalized = text.toLowerCase().trim();
-  if (!normalized) return [];
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const tokens: string[] = [];
+  const codeIdentifiers = trimmed.match(/[A-Za-z][A-Za-z0-9_.-]{1,}/g) ?? [];
+  for (const identifier of codeIdentifiers) {
+    tokens.push(...splitCodeIdentifier(identifier));
+  }
+  const normalized = trimmed.toLowerCase();
   try {
     const segmenter = new Intl.Segmenter("zh", { granularity: "word" });
-    const words = [...segmenter.segment(normalized)]
-      .filter((part) => part.isWordLike)
-      .map((part) => part.segment.trim())
-      .filter((word) => word.length >= 2);
-    return [...new Set(words)].slice(0, 16);
+    for (const part of segmenter.segment(normalized)) {
+      if (!part.isWordLike) continue;
+      const word = part.segment.trim();
+      if (word.length >= 2) tokens.push(word);
+    }
   } catch {
     // Older runtimes without Intl.Segmenter: Latin words + CJK bigrams.
-    const tokens: string[] = [];
     for (const chunk of normalized.split(/[\s,，。；;:：、/\\|()（）\[\]{}<>《》"'`]+/)) {
       if (!chunk) continue;
       if (/[\u3400-\u9fff]/.test(chunk)) {
@@ -163,8 +219,47 @@ function tokenize(text: string): string[] {
         tokens.push(chunk);
       }
     }
-    return [...new Set(tokens)].slice(0, 16);
   }
+  return [...new Set(tokens)].slice(0, 24);
+}
+
+function normalizeFilePath(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+export function filePathMatches(relatedFiles: string[], targetFile: string): boolean {
+  const target = normalizeFilePath(targetFile);
+  if (!target || relatedFiles.length === 0) return false;
+  const targetHasDir = target.includes("/");
+  const targetBase = target.split("/").pop() ?? target;
+  const targetStem = targetBase.replace(/\.[^.]+$/, "");
+  for (const entry of relatedFiles) {
+    const candidate = normalizeFilePath(entry);
+    if (!candidate) continue;
+    if (candidate === target || target.endsWith(`/${candidate}`) || candidate.endsWith(`/${target}`)) {
+      return true;
+    }
+    const candidateHasDir = candidate.includes("/");
+    if (!targetHasDir || !candidateHasDir) {
+      const candidateBase = candidate.split("/").pop() ?? candidate;
+      const candidateStem = candidateBase.replace(/\.[^.]+$/, "");
+      if (candidateBase === targetBase || (candidateStem.length >= 3 && candidateStem === targetStem)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while ((index = haystack.indexOf(needle, index)) !== -1) {
+    count++;
+    index += needle.length;
+  }
+  return count;
 }
 
 export function tokenizeQuery(text: string): string[] {
@@ -179,7 +274,14 @@ export class MemoryStore {
   private db: Database | null = null;
   private opening: Promise<Database> | null = null;
   private transaction: Transaction | null = null;
-  private readOnlySchema?: { hasMeta: boolean; hasConflicts: boolean; hasRecallFlag: boolean };
+  private readOnlySchema?: {
+    hasMeta: boolean;
+    hasConflicts: boolean;
+    hasRecallFlag: boolean;
+    hasHistory: boolean;
+    hasStats: boolean;
+    hasSessionState: boolean;
+  };
 
   constructor(private readonly options: StoreOptions) {}
 
@@ -288,7 +390,14 @@ export class MemoryStore {
           const hasConflicts = tables.has("memory_conflicts");
           const hasRecallFlag = hasConflicts && (await db.all("PRAGMA table_info(memory_conflicts)"))
             .some(row => row.name === "blocks_recall");
-          this.readOnlySchema = { hasMeta: tables.has("project_meta"), hasConflicts, hasRecallFlag };
+          this.readOnlySchema = {
+            hasMeta: tables.has("project_meta"),
+            hasConflicts,
+            hasRecallFlag,
+            hasHistory: tables.has("memory_history"),
+            hasStats: tables.has("memory_stats"),
+            hasSessionState: tables.has("session_state"),
+          };
         } else {
           await this.initialize(db);
         }
@@ -465,6 +574,11 @@ export class MemoryStore {
       CREATE TABLE IF NOT EXISTS memory_evidence_times (
         memory_id TEXT PRIMARY KEY,
         evidence_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS memory_stats (
+        memory_id TEXT PRIMARY KEY,
+        recall_count INTEGER NOT NULL DEFAULT 0,
+        last_recalled_at INTEGER
       );
       CREATE TRIGGER IF NOT EXISTS memories_history_before_update
       BEFORE UPDATE ON memories
@@ -725,6 +839,109 @@ export class MemoryStore {
       WHERE m.status = 'active' ORDER BY c.created_at DESC`) as Promise<MemoryConflict[]>;
   }
 
+  async listConflictSummaries(): Promise<ConflictSummary[]> {
+    const db = await this.query();
+    if (this.readOnlySchema?.hasConflicts === false) return [];
+    const recallExpr = this.readOnlySchema?.hasRecallFlag === false ? "0" : "MAX(c.blocks_recall)";
+    const rows = (await db.all(
+      `SELECT m.id, m.version, m.title, COUNT(*) AS candidate_count, ${recallExpr} AS blocks_recall
+       FROM memory_conflicts c
+       JOIN memories m ON m.id = c.memory_id AND m.version = c.memory_version
+       WHERE m.status = 'active'
+       GROUP BY m.id, m.version, m.title
+       ORDER BY MAX(c.created_at) DESC`
+    )) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      version: Number(row.version),
+      title: String(row.title),
+      candidateCount: Number(row.candidate_count),
+      blocksRecall: Number(row.blocks_recall) === 1,
+    }));
+  }
+
+  async clearConflicts(id: string, version: number): Promise<number> {
+    const db = await this.query();
+    const result = await db.run(
+      "DELETE FROM memory_conflicts WHERE memory_id = ? AND memory_version = ?",
+      id,
+      version
+    );
+    return Number(result.changes);
+  }
+
+  async listHistory(id: string): Promise<MemoryHistoryEntry[]> {
+    const db = await this.query();
+    if (this.readOnlySchema?.hasHistory === false) return [];
+    const rows = (await db.all(
+      "SELECT * FROM memory_history WHERE memory_id = ? ORDER BY version DESC",
+      id
+    )) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      memory_id: String(row.memory_id),
+      version: Number(row.version),
+      title: String(row.title),
+      category: String(row.category) as MemoryCategory,
+      content: String(row.content),
+      related_files: parseRelatedFiles(row.related_files),
+      source: String(row.source) as MemorySource,
+      source_ref: row.source_ref == null ? null : String(row.source_ref),
+      status: String(row.status) as MemoryStatus,
+      updated_at: Number(row.updated_at),
+    }));
+  }
+
+  async recordRecalls(ids: string[], at = Date.now()): Promise<void> {
+    if (ids.length === 0 || this.options.readOnly) return;
+    const db = await this.query();
+    for (const id of ids) {
+      await db.run(
+        `INSERT INTO memory_stats (memory_id, recall_count, last_recalled_at) VALUES (?, 1, ?)
+         ON CONFLICT(memory_id) DO UPDATE SET
+           recall_count = memory_stats.recall_count + 1,
+           last_recalled_at = excluded.last_recalled_at`,
+        id,
+        at
+      );
+    }
+  }
+
+  async getRecallStats(): Promise<Map<string, RecallStats>> {
+    const result = new Map<string, RecallStats>();
+    const db = await this.query();
+    if (this.readOnlySchema?.hasStats === false) return result;
+    const rows = (await db.all(
+      "SELECT memory_id, recall_count, last_recalled_at FROM memory_stats"
+    )) as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      result.set(String(row.memory_id), {
+        recallCount: Number(row.recall_count ?? 0),
+        lastRecalledAt: row.last_recalled_at == null ? null : Number(row.last_recalled_at),
+      });
+    }
+    return result;
+  }
+
+  async listSessionStates(): Promise<Array<SessionState & { session_id: string }>> {
+    const db = await this.query();
+    if (this.readOnlySchema?.hasSessionState === false) return [];
+    const rows = (await db.all(
+      `SELECT session_id, last_extracted_message_id, last_extracted_offset, last_extracted_at,
+              attempt_target_id, failed_attempts, failed_at
+       FROM session_state
+       ORDER BY COALESCE(failed_at, last_extracted_at, 0) DESC`
+    )) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      session_id: String(row.session_id),
+      last_extracted_message_id: row.last_extracted_message_id == null ? null : String(row.last_extracted_message_id),
+      last_extracted_offset: Number(row.last_extracted_offset ?? 0),
+      last_extracted_at: row.last_extracted_at == null ? null : Number(row.last_extracted_at),
+      attempt_target_id: row.attempt_target_id == null ? null : String(row.attempt_target_id),
+      failed_attempts: Number(row.failed_attempts ?? 0),
+      failed_at: row.failed_at == null ? null : Number(row.failed_at),
+    }));
+  }
+
   async getEvidenceTime(id: string): Promise<number | undefined> {
     const db = await this.query();
     const row = await db.get("SELECT evidence_at FROM memory_evidence_times WHERE memory_id = ?", id) as { evidence_at?: number } | null;
@@ -764,60 +981,77 @@ export class MemoryStore {
     }));
   }
 
-  /** Keyword + vector hybrid search over active memories. */
-  async search(query: string, vector: Float32Array, limit: number, includeConflicts = false): Promise<MemorySearchHit[]> {
+  /**
+   * BM25 + vector RRF hybrid search over active memories, with optional
+   * minimum relevance threshold and related-file path boost.
+   */
+  async search(
+    query: string,
+    vector: Float32Array,
+    limit: number,
+    options: boolean | SearchOptions = false
+  ): Promise<MemorySearchHit[]> {
+    const opts: SearchOptions =
+      typeof options === "boolean" ? { includeConflicts: options } : options;
+    const includeConflicts = opts.includeConflicts ?? false;
+    const minScore = includeConflicts ? 0 : (opts.minScore ?? 0);
+    const relatedFile = opts.relatedFile?.trim() || undefined;
+
     const db = await this.connection();
     const json = JSON.stringify(Array.from(vector));
     const active = includeConflicts ? "status = 'active'" : AVAILABLE_MEMORY;
-    const candidateLimit = Math.max(limit * 3, 20);
-    const candidates = new Map<string, { similarity: number; keyword: number }>();
+    const candidateLimit = Math.max(limit * 4, 30);
+    const candidateIds = new Set<string>();
 
     const vectorRows = (await db.all(
-      `SELECT id, 1 - vector_distance_cos(vector, vector32(?)) AS similarity
+      `SELECT id
        FROM memories
        WHERE ${active}
        ORDER BY vector_distance_cos(vector, vector32(?)) ASC
        LIMIT ?`,
       json,
-      json,
       candidateLimit
-    )) as Array<Record<string, unknown>>;
+    )) as Array<{ id?: string }>;
     for (const row of vectorRows) {
-      candidates.set(String(row.id), {
-        similarity: Math.max(0, Math.min(1, Number(row.similarity))),
-        keyword: 0,
-      });
+      if (row.id) candidateIds.add(String(row.id));
     }
 
     const tokens = tokenize(query);
-    if (tokens.length > 0) {
-      const keywordCounts = new Map<string, number>();
-      for (const token of tokens) {
-        const pattern = `%${escapeLike(token)}%`;
-        const rows = (await db.all(
-          `SELECT id FROM memories
-           WHERE ${active}
-             AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR related_files LIKE ? ESCAPE '\\')
-           LIMIT ?`,
-          pattern,
-          pattern,
-          pattern,
-          candidateLimit
-        )) as Array<{ id?: string }>;
-        for (const row of rows) {
-          const id = String(row.id);
-          keywordCounts.set(id, (keywordCounts.get(id) ?? 0) + 1);
-        }
-      }
-      for (const [id, count] of keywordCounts) {
-        const existing = candidates.get(id);
-        const keyword = count / tokens.length;
-        if (existing) existing.keyword = keyword;
-        else candidates.set(id, { similarity: 0, keyword });
+    for (const token of tokens) {
+      const pattern = `%${escapeLike(token)}%`;
+      const rows = (await db.all(
+        `SELECT id FROM memories
+         WHERE ${active}
+           AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR related_files LIKE ? ESCAPE '\\')
+         LIMIT ?`,
+        pattern,
+        pattern,
+        pattern,
+        candidateLimit
+      )) as Array<{ id?: string }>;
+      for (const row of rows) {
+        if (row.id) candidateIds.add(String(row.id));
       }
     }
 
-    const ids = [...candidates.keys()];
+    if (relatedFile) {
+      const normalizedTarget = normalizeFilePath(relatedFile);
+      const base = normalizedTarget.split("/").pop() ?? normalizedTarget;
+      const stem = base.replace(/\.[^.]+$/, "");
+      const filePattern = `%${escapeLike(stem.length >= 3 ? stem : base)}%`;
+      const fileRows = (await db.all(
+        `SELECT id FROM memories
+         WHERE ${active} AND related_files != '[]' AND lower(related_files) LIKE ? ESCAPE '\\'
+         LIMIT ?`,
+        filePattern,
+        candidateLimit
+      )) as Array<{ id?: string }>;
+      for (const row of fileRows) {
+        if (row.id) candidateIds.add(String(row.id));
+      }
+    }
+
+    const ids = [...candidateIds];
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
     const rows = (await db.all(
@@ -828,17 +1062,104 @@ export class MemoryStore {
       ...ids
     )) as Array<Record<string, unknown>>;
 
-    const hasKeyword = tokens.length > 0;
-    const hits = rows.map((row) => {
+    interface ScoredCandidate {
+      record: MemoryRecord;
+      vectorSim: number;
+      bm25: number;
+      keywordCoverage: number;
+      fileMatched: boolean;
+      relevance: number;
+    }
+
+    const docs = rows.map((row) => {
       const record = rowToRecord(row);
-      const candidate = candidates.get(record.id) ?? { similarity: 0, keyword: 0 };
-      const similarity = hasKeyword
-        ? candidate.similarity * 0.7 + candidate.keyword * 0.3
-        : candidate.similarity;
-      return { ...record, similarity };
+      const vectorSim = Math.max(0, Math.min(1, Number(row.similarity)));
+      const titleLower = record.title.toLowerCase();
+      const contentLower = record.content.toLowerCase();
+      const filesLower = record.related_files.join(" ").toLowerCase();
+      const docLen = Math.max(1, titleLower.length * 2 + contentLower.length + filesLower.length);
+      return { record, vectorSim, titleLower, contentLower, filesLower, docLen };
     });
-    hits.sort((a, b) => b.similarity - a.similarity);
-    return hits.slice(0, limit);
+
+    const N = docs.length;
+    const avgDocLen = docs.reduce((sum, d) => sum + d.docLen, 0) / Math.max(1, N);
+    const df = new Map<string, number>();
+    for (const token of tokens) {
+      let count = 0;
+      for (const doc of docs) {
+        if (
+          doc.titleLower.includes(token) ||
+          doc.contentLower.includes(token) ||
+          doc.filesLower.includes(token)
+        ) {
+          count++;
+        }
+      }
+      df.set(token, count);
+    }
+
+    const k1 = 1.2;
+    const b = 0.75;
+    const hasKeyword = tokens.length > 0;
+    const scored: ScoredCandidate[] = [];
+
+    for (const doc of docs) {
+      let bm25 = 0;
+      let matchedTokens = 0;
+      for (const token of tokens) {
+        const tf =
+          countOccurrences(doc.titleLower, token) * 2.0 +
+          countOccurrences(doc.filesLower, token) * 1.5 +
+          countOccurrences(doc.contentLower, token) * 1.0;
+        if (tf <= 0) continue;
+        matchedTokens++;
+        const docFreq = df.get(token) ?? 0;
+        const idf = Math.log(1 + (N - docFreq + 0.5) / (docFreq + 0.5));
+        bm25 += idf * ((tf * (k1 + 1)) / (tf + k1 * (1 - b + (b * doc.docLen) / avgDocLen)));
+      }
+      const keywordCoverage = hasKeyword ? matchedTokens / tokens.length : 0;
+      const fileMatched = relatedFile ? filePathMatches(doc.record.related_files, relatedFile) : false;
+      const baseRelevance = hasKeyword
+        ? doc.vectorSim * 0.65 + keywordCoverage * 0.35
+        : doc.vectorSim;
+      const relevance = Math.min(1, baseRelevance + (fileMatched ? 0.25 : 0));
+
+      if (minScore > 0 && relevance < minScore) continue;
+      scored.push({
+        record: doc.record,
+        vectorSim: doc.vectorSim,
+        bm25,
+        keywordCoverage,
+        fileMatched,
+        relevance,
+      });
+    }
+
+    if (scored.length === 0) return [];
+
+    // Reciprocal Rank Fusion across vector similarity, BM25 keyword score, and file path match.
+    const vecRanked = [...scored].sort((a, b) => b.vectorSim - a.vectorSim);
+    const vecRankMap = new Map(vecRanked.map((item, idx) => [item.record.id, idx + 1]));
+
+    const bm25Ranked = scored.filter((item) => item.bm25 > 0).sort((a, b) => b.bm25 - a.bm25);
+    const bm25RankMap = new Map(bm25Ranked.map((item, idx) => [item.record.id, idx + 1]));
+
+    const RRF_K = 60;
+    const fused = scored.map((item) => {
+      const vecRank = vecRankMap.get(item.record.id) ?? scored.length + 1;
+      const bm25Rank = bm25RankMap.get(item.record.id);
+      const rrf =
+        1 / (RRF_K + vecRank) +
+        (bm25Rank !== undefined ? 1 / (RRF_K + bm25Rank) : 0) +
+        (item.fileMatched ? 1 / 40 : 0);
+      return { ...item, rrf };
+    });
+
+    fused.sort((a, b) => b.rrf - a.rrf || b.relevance - a.relevance);
+    return fused.slice(0, limit).map((item) => ({
+      ...item.record,
+      similarity: item.relevance,
+    }));
   }
 
   async listActiveTitles(limit: number): Promise<Array<Pick<MemoryRecord, "id" | "category" | "title">>> {

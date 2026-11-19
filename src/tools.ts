@@ -26,6 +26,10 @@ const SEARCH_INPUT = {
       minimum: 1,
       maximum: 50,
     },
+    related_file: {
+      type: "string",
+      description: "当前正在查看或修改的文件路径（可选），命中关联文件的记忆会优先召回。",
+    },
   },
   required: ["query"],
   additionalProperties: false,
@@ -101,14 +105,15 @@ export async function registerMemoryTools(ctx: Context, service: MemoryService, 
       description:
         "检索本项目已沉淀的业务规则、架构决策、数据约束和踩坑记录。在修改业务逻辑、数据结构或状态流转之前，必须先调用本工具确认既有约束，避免只按代码字面实现而违反业务规则。仅返回可用的 active 条目；需要修改或归档时，使用返回的 id 和 version。",
       input: SEARCH_INPUT as unknown as never,
-      execute: async (args: { query?: string; limit?: number }, context) => {
+      execute: async (args: { query?: string; limit?: number; related_file?: string }, context) => {
         const started = Date.now();
         try {
-          const hits = await service.search(args.query ?? "", args.limit ?? 5);
+          const hits = await service.search(args.query ?? "", args.limit ?? 5, false, args.related_file);
           log("memory search", {
             session_id: context.sessionID,
             query_chars: (args.query ?? "").length,
             limit: args.limit ?? 5,
+            has_related_file: Boolean(args.related_file),
             hits: hits.length,
             ms: Date.now() - started,
           });

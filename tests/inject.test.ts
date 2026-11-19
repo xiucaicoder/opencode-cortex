@@ -42,4 +42,15 @@ describe("memory context injection", () => {
     cache.clear("s1");
     expect(await cache.get("s1")).toBe("block-2");
   });
+
+  it("surfaces pending conflict headings with accurate recall status and no bodies", () => {
+    const text = buildInjectionText("", [], 150, [
+      { id: "a1b2c3d4", version: 2, title: "普通商品售后期限", candidateCount: 1, blocksRecall: true },
+      { id: "e5f6a7b8", version: 1, title: "退款渠道说明", candidateCount: 2, blocksRecall: false },
+    ]);
+    expect(text).toContain("## 待确认冲突\n");
+    expect(text).toContain("[a1b2c3d4] v2 普通商品售后期限（已暂停召回，1 条候选）");
+    expect(text).toContain("[e5f6a7b8] v1 退款渠道说明（仍可召回，存在待确认候选，2 条候选）");
+    expect(text).toContain("cortex resolve");
+  });
 });

@@ -10,12 +10,17 @@ import { findBlockedField } from "./secrets.js";
 import {
   CATEGORIES,
   MemoryStore,
+  type ConflictSummary,
   type ExtractionCursor,
   type MemoryCategory,
+  type MemoryConflict,
+  type MemoryHistoryEntry,
   type MemoryRecord,
   type MemorySource,
+  type RecallStats,
   type SessionState,
 } from "./store.js";
+export type { ConflictSummary, MemoryConflict, MemoryHistoryEntry, RecallStats };
 
 export type Actor = "tool" | "auto" | "import";
 export interface VerifiedMutation extends MutateInput {
@@ -226,20 +231,143 @@ export class MemoryService {
     await this.embedder.dispose();
   }
 
-  async search(query: string, limit = 5, includeConflicts = false): Promise<MemoryHit[]> {
+  async search(
+    query: string,
+    limit = 5,
+    includeConflicts = false,
+    relatedFile?: string
+  ): Promise<MemoryHit[]> {
     await this.ready();
     if (typeof query !== "string" || !query.trim()) {
       throw new MemoryError("missing_field", "query 不能为空");
     }
     const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit || 5)));
     const vector = await this.embed(`${query.trim()}`);
-    const hits = await this.store.search(query.trim(), vector, safeLimit, includeConflicts);
+    const hits = await this.store.search(query.trim(), vector, safeLimit, {
+      includeConflicts,
+      minScore: includeConflicts ? 0 : this.config.searchMinScore,
+      relatedFile,
+    });
+    if (!includeConflicts && hits.length > 0) {
+      await this.store.recordRecalls(hits.map((hit) => hit.id)).catch(() => {});
+    }
     return hits.map(toHit);
   }
 
-  async listConflicts(): Promise<unknown[]> {
+  async listConflicts(): Promise<MemoryConflict[]> {
     await this.ready();
     return this.store.listConflicts();
+  }
+
+  async listConflictSummaries(): Promise<ConflictSummary[]> {
+    await this.ready();
+    return this.store.listConflictSummaries();
+  }
+
+  async listHistory(id: string): Promise<MemoryHistoryEntry[]> {
+    await this.ready();
+    return this.store.listHistory(id);
+  }
+
+  async getRecallStats(): Promise<Map<string, RecallStats>> {
+    await this.ready();
+    return this.store.getRecallStats();
+  }
+
+  /**
+   * Resolve pending conflicts for a memory:
+   * - `keep`: retain current version and clear its conflict flags so recall resumes.
+   * - `accept`: adopt a specific candidate (matched by stable content+source_ref or 1-based index).
+   * - `custom`: update with custom title/content as a new version.
+   */
+  async resolveConflict(
+    id: string,
+    resolution:
+      | { action: "keep"; expectedVersion?: number }
+      | {
+          action: "accept";
+          candidate?: { content: string; source_ref: string };
+          candidateIndex?: number;
+          expectedVersion?: number;
+        }
+      | { action: "custom"; title?: string; content: string; expectedVersion?: number }
+  ): Promise<{ id: string; version: number; action: "kept" | "updated"; cleared: number }> {
+    await this.ready();
+    const current = await this.store.getById(id);
+    if (!current) throw new MemoryError("not_found", `记忆 ${id} 不存在`, { id });
+    if (current.status !== "active") {
+      throw new MemoryError("archived", `记忆 ${id} 已归档，无法解决冲突`, { id });
+    }
+    if (
+      resolution.expectedVersion !== undefined &&
+      current.version !== resolution.expectedVersion
+    ) {
+      throw new MemoryError(
+        "version_conflict",
+        `版本冲突：当前 version 为 ${current.version}，确认时展示的是 ${resolution.expectedVersion}。请重新查看冲突列表后再试`,
+        { id, current_version: current.version }
+      );
+    }
+    const allConflicts = (await this.store.listConflicts()).filter(
+      (item) => item.memory_id === id && item.memory_version === current.version
+    );
+    if (allConflicts.length === 0) {
+      throw new MemoryError("not_found", `记忆 ${id} 当前版本没有待处理冲突`, { id });
+    }
+
+    if (resolution.action === "keep") {
+      const cleared = await this.store.clearConflicts(id, current.version);
+      log("memory conflict resolved", { id, version: current.version, action: "keep", cleared });
+      return { id, version: current.version, action: "kept", cleared };
+    }
+
+    let nextTitle = current.title;
+    let nextContent = current.content;
+    let nextCategory: string = current.category;
+    let nextSourceRef: string | undefined = current.source_ref ?? undefined;
+
+    if (resolution.action === "accept") {
+      let chosen: MemoryConflict | undefined;
+      if (resolution.candidate) {
+        chosen = allConflicts.find(
+          (item) =>
+            item.content === resolution.candidate!.content &&
+            item.source_ref === resolution.candidate!.source_ref
+        );
+        if (!chosen) {
+          throw new MemoryError("not_found", "所选冲突候选已不存在或已变更，请重新查看冲突列表", { id });
+        }
+      } else {
+        const index = (resolution.candidateIndex ?? 1) - 1;
+        chosen = allConflicts[index];
+        if (!chosen) {
+          throw new MemoryError("invalid_action", `候选序号超出范围（共 ${allConflicts.length} 条）`);
+        }
+      }
+      nextTitle = chosen.title || current.title;
+      nextContent = chosen.content;
+      nextCategory = chosen.category || current.category;
+      nextSourceRef = chosen.source_ref || nextSourceRef;
+    } else {
+      nextTitle = resolution.title?.trim() || current.title;
+      nextContent = resolution.content;
+    }
+
+    const updated = await this.mutate(
+      {
+        action: "update",
+        id,
+        version: current.version,
+        title: nextTitle,
+        category: nextCategory,
+        content: nextContent,
+        related_files: current.related_files,
+        source_ref: nextSourceRef,
+      },
+      "tool"
+    );
+    log("memory conflict resolved", { id, version: updated.version, action: resolution.action });
+    return { id, version: updated.version, action: "updated", cleared: allConflicts.length };
   }
 
   /**

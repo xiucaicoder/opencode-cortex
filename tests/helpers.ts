@@ -66,6 +66,7 @@ export function createTestRuntime(
     dedupRejectThreshold: 0.92,
     dedupRelatedThreshold: 0.75,
     dedupRelatedLimit: 3,
+    searchMinScore: 0.35,
     blockedPatterns: [],
     autoCaptureDryRun: false,
     debugCapture: false,

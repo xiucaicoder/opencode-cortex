@@ -33,6 +33,8 @@ export interface CortexConfig {
   dedupRelatedThreshold: number;
   /** Maximum number of related entries returned after a successful add. */
   dedupRelatedLimit: number;
+  /** Minimum relevance score [0, 1] required for memory_search hits. */
+  searchMinScore: number;
   /** Extra regular expressions rejected in title/content/related_files/source_ref. */
   blockedPatterns: string[];
   /** Capture extraction output to dry-run.jsonl instead of writing memories. */
@@ -77,6 +79,7 @@ const DEFAULTS: CortexConfig = {
   dedupRejectThreshold: 0.92,
   dedupRelatedThreshold: 0.75,
   dedupRelatedLimit: 3,
+  searchMinScore: 0.35,
   blockedPatterns: [],
   autoCaptureDryRun: false,
   debugCapture: false,
@@ -220,6 +223,7 @@ export function loadConfig(directory: string): CortexConfig {
       DEFAULTS.dedupRelatedThreshold
     ),
     dedupRelatedLimit: numberField(raw, "dedupRelatedLimit", DEFAULTS.dedupRelatedLimit),
+    searchMinScore: thresholdField(raw, "searchMinScore", DEFAULTS.searchMinScore),
     blockedPatterns: Array.isArray(raw.blockedPatterns)
       ? raw.blockedPatterns.map((value, index) => {
           if (typeof value !== "string" || !value) {
